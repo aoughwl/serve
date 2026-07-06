@@ -1,7 +1,7 @@
 # serve
 
-A pure-nimony **HTTP/1.1 static-file server** built on `std/ioring`
-(io_uring-style async TCP; Linux-only).
+A pure-nimony **HTTP/1.1 static-file server** with a small TCP transport
+abstraction.
 
 Generic HTTP helpers live in the separate `http` package: headers, URL/query/form
 helpers, request parsing, status metadata, and response building. `serve`
@@ -21,8 +21,9 @@ serve("/var/www", 8080, 3)     # serve 3 requests then return (handy for tests)
 
 | symbol | from | role |
 |--------|------|------|
-| `serve(root, port, maxRequests = 0)` | `serve/loop` | the accept/serve loop over io_uring |
+| `serve(root, port, maxRequests = 0)` | `serve/loop` | the accept/serve loop |
 | `Header`, `Request`, `Response`, `parseRequest`, `httpResponse`, URL helpers | `http` | re-exported generic HTTP layer |
+| `TcpCompletion`, `listenTcpPort`, `submitTcpRead`, `submitTcpWrite` | `serve/tcp` | transport abstraction |
 | `contentTypeFor`, `normalizeUrlPath`, `relativePath`, `staticResponse`, `serveFile` | `serve/static` | URL → file routing + content-type |
 
 `serve/http` is a compatibility umbrella that re-exports the generic `http`
@@ -38,8 +39,8 @@ assert queryParam(req.path, "q") == "nimony"
 
 ## Notes
 
-* **Linux-only** — it uses io_uring via `std/ioring`. Showcase-grade, not
-  hardened for the open internet.
+* **Transport boundary** — `serve/loop` uses `serve/tcp`; the current backend is
+  `serve/tcp_ioring`, and future backends should be added behind `serve/tcp`.
 * **Clean module boundaries** — generic HTTP code lives in `http`; static file
   handling lives in `serve/static`; sockets live in `serve/loop`.
 * **Nimony-friendly** — parsing char-walks rather than slicing where practical

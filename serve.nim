@@ -1,6 +1,5 @@
-## serve — an HTTP/1.1 static-file server on `std/ioring` (io_uring-style TCP;
-## Linux-only). It depends on the generic `http` helper package and has no
-## framework dependency.
+## serve — an HTTP/1.1 static-file server. It depends on the generic `http`
+## helper package and has no framework dependency.
 ##
 ##   import serve
 ##
@@ -10,6 +9,7 @@
 ## API surface:
 ##   * `serve(root, port, maxRequests = 0)`  — the accept/serve loop
 ##   * generic HTTP helpers                  — re-exported from `http`
+##   * `TcpCompletion`, TCP primitives       — transport abstraction
 ##   * `serveFile`, `staticResponse`         — URL->file routing (static.aowl)
 
 import http/headers
@@ -17,5 +17,6 @@ import http/url
 import http/request
 import http/response
 import serve/static
+import serve/tcp
 import serve/loop
-export headers, url, request, response, static, loop
+export headers, url, request, response, static, tcp, loop
