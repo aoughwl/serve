@@ -67,13 +67,7 @@ proc serve*(root: string; port: int; maxRequests = 0) =
       if n > 0:
         let raw = bufToString(n)
         stageResponse(route(root, raw))
-        var sent = 0
-        while sent < respLen:
-          let nWritten = writeTcp(clientFd, addr respBuf[sent], respLen - sent)
-          if nWritten <= 0:
-            sent = respLen
-          else:
-            sent = sent + nWritten
+        discard writeAllTcp(clientFd, addr respBuf[0], respLen)
       closeTcp(clientFd)
       inc served
   closeTcp(l)
