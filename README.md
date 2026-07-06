@@ -8,6 +8,9 @@ helpers, request parsing, status metadata, and response building. `serve`
 consumes and re-exports that package, but keeps sockets and static-file routing
 in this package.
 
+Native TCP primitives live in the separate `tcp` package and are re-exported by
+`serve`.
+
 No framework dependency.
 
 ```nim
@@ -23,8 +26,7 @@ serve("/var/www", 8080, 3)     # serve 3 requests then return (handy for tests)
 |--------|------|------|
 | `serve(root, port, maxRequests = 0)` | `serve/loop` | the accept/serve loop |
 | `Header`, `Request`, `Response`, `parseRequest`, `httpResponse`, URL helpers | `http` | re-exported generic HTTP layer |
-| `TcpCompletion`, `TcpOp` | `serve/tcp_types` | backend-neutral transport types |
-| `listenTcpPort`, `submitTcpRead`, `submitTcpWrite` | `serve/tcp` | transport abstraction |
+| `TcpHandle`, `listenTcp`, `acceptTcp`, `readTcp`, `writeTcp`, `closeTcp` | `tcp` | native TCP abstraction |
 | `contentTypeFor`, `normalizeUrlPath`, `relativePath`, `staticResponse`, `serveFile` | `serve/static` | URL → file routing + content-type |
 
 `serve/http` is a compatibility umbrella that re-exports the generic `http`
@@ -40,8 +42,7 @@ assert queryParam(req.path, "q") == "nimony"
 
 ## Notes
 
-* **Transport boundary** — `serve/loop` uses `serve/tcp`; the current backend is
-  `serve/tcp_ioring`, and future backends should be added behind `serve/tcp`.
+* **Transport boundary** — `serve/loop` uses the standalone `tcp` package.
 * **Clean module boundaries** — generic HTTP code lives in `http`; static file
   handling lives in `serve/static`; sockets live in `serve/loop`.
 * **Nimony-friendly** — parsing char-walks rather than slicing where practical

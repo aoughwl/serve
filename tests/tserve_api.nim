@@ -2,8 +2,8 @@
 
 import serve
 
-var comp = TcpCompletion(op: tcpAccept, fd: 0.cint, result: 0)
-discard comp
+var fd = InvalidTcpHandle
+discard fd
 
 discard contentTypeFor("/tmp/index.html")
 discard normalizeUrlPath("/x?q=1")

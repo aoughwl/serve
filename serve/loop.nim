@@ -12,8 +12,8 @@
 import std/syncio
 import http/request
 import http/response
-import static
 import tcp
+import static
 
 var readBuf = default(array[8192, char])
 var respBuf = default(array[1048576, char])
@@ -53,35 +53,29 @@ proc serve*(root: string; port: int; maxRequests = 0) =
   ## Serve static files under `root` on `port`. Loops forever unless
   ## `maxRequests > 0`, in which case it exits after that many responses.
   initTcp()
-  let l = listenTcpPort(port)
+  let l = listenTcp(port)
+  if l == InvalidTcpHandle:
+    echo "failed to listen on :", port
+    shutdownTcp()
+    return
   echo "serving ", root, " on :", port, " (fd=", l, ")"
-  submitTcpAccept(l)
-
-  var comps = default(array[16, TcpCompletion])
   var served = 0
   while maxRequests == 0 or served < maxRequests:
-    let n = waitTcpCompletions(comps)
-    var i = 0
-    while i < n:
-      let c = comps[i]
-      case c.op
-      of tcpAccept:
-        submitTcpAccept(l)
-        let clientFd = c.result.cint
-        if clientFd >= 0:
-          setTcpNonBlocking(clientFd)
-          submitTcpRead(clientFd, addr readBuf[0], readBuf.len)
-      of tcpRead:
-        if c.result <= 0:
-          closeTcp(c.fd)
-        else:
-          let raw = bufToString(c.result)
-          stageResponse(route(root, raw))
-          submitTcpWrite(c.fd, addr respBuf[0], respLen)
-      of tcpWrite:
-        closeTcp(c.fd)
-        inc served
-      inc i
+    let clientFd = acceptTcp(l)
+    if clientFd != InvalidTcpHandle:
+      let n = readTcp(clientFd, addr readBuf[0], readBuf.len)
+      if n > 0:
+        let raw = bufToString(n)
+        stageResponse(route(root, raw))
+        var sent = 0
+        while sent < respLen:
+          let nWritten = writeTcp(clientFd, addr respBuf[sent], respLen - sent)
+          if nWritten <= 0:
+            sent = respLen
+          else:
+            sent = sent + nWritten
+      closeTcp(clientFd)
+      inc served
   closeTcp(l)
   shutdownTcp()
   echo "served ", served, " request(s); exiting"
