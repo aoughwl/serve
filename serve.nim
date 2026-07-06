@@ -1,17 +1,15 @@
 ## serve — an HTTP/1.1 static-file server on `std/ioring` (io_uring-style TCP;
-## Linux-only). It depends on the generic `aoughwl/http` helper pack but does
-## NOT depend on the aoughwl substrate or ui/web/html/css packs.
+## Linux-only). It depends on the generic `http` helper package and has no
+## framework dependency.
 ##
-##   import aoughwl/serve/serve
+##   import serve
 ##
 ##   serve("/var/www", 8080)          # loop forever
 ##   serve("/var/www", 8080, 3)       # serve 3 requests then return (tests)
-##   serveWithOptions("/var/www", 8080, defaultServeOptions())
 ##
 ## API surface:
-##   * `serve(root, port, maxRequests = 0)`  — compatibility static server API
-##   * `ServeOptions`, `serveWithOptions`    — configured accept/serve loop
-##   * generic HTTP helpers                  — re-exported from `aoughwl/http`
+##   * `serve(root, port, maxRequests = 0)`  — the accept/serve loop
+##   * generic HTTP helpers                  — re-exported from `http`
 ##   * `serveFile`, `staticResponse`         — URL->file routing (static.aowl)
 
 import http/headers
