@@ -6,8 +6,8 @@
 ## N served responses (used by demos/tests).
 ##
 ## This loop is deliberately simple and single-response-at-a-time. The generic
-## HTTP parsing/response helpers live in `http`; TCP details are behind
-## `serve/tcp`.
+## HTTP parsing/response helpers live in `http`; TCP details are behind the
+## standalone `tcp` package.
 
 import std/syncio
 import http/request
