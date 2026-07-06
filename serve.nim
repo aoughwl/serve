@@ -6,9 +6,11 @@
 ##
 ##   serve("/var/www", 8080)          # loop forever
 ##   serve("/var/www", 8080, 3)       # serve 3 requests then return (tests)
+##   serveWithOptions("/var/www", 8080, defaultServeOptions())
 ##
 ## API surface:
-##   * `serve(root, port, maxRequests = 0)`  — the accept/serve loop (loop.aowl)
+##   * `serve(root, port, maxRequests = 0)`  — compatibility static server API
+##   * `ServeOptions`, `serveWithOptions`    — configured accept/serve loop
 ##   * generic HTTP helpers                  — re-exported from `aoughwl/http`
 ##   * `serveFile`, `staticResponse`         — URL->file routing (static.aowl)
 

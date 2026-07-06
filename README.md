@@ -15,6 +15,12 @@ import serve
 
 serve("/var/www", 8080)        # serve forever
 serve("/var/www", 8080, 3)     # serve 3 requests then return (handy for tests)
+
+var opts = defaultServeOptions()
+opts.maxConnections = 32
+opts.maxRequestBytes = 8192
+opts.maxResponseBytes = 512 * 1024
+serveWithOptions("/var/www", 8080, opts)
 ```
 
 ## API
@@ -22,6 +28,7 @@ serve("/var/www", 8080, 3)     # serve 3 requests then return (handy for tests)
 | symbol | from | role |
 |--------|------|------|
 | `serve(root, port, maxRequests = 0)` | `serve/loop` | the accept/serve loop over io_uring |
+| `ServeOptions`, `defaultServeOptions`, `serveWithOptions` | `serve/loop` | configured server limits |
 | `Header`, `Request`, `Response`, `parseRequest`, `httpResponse`, URL helpers | `http` | re-exported generic HTTP layer |
 | `contentTypeFor`, `normalizeUrlPath`, `relativePath`, `staticResponse`, `serveFile` | `serve/static` | URL → file routing + content-type |
 
@@ -46,6 +53,13 @@ assert queryParam(req.path, "q") == "nimony"
 * **Static serving behavior** — supports `GET`, `HEAD`, and `OPTIONS`, strips
   query/fragment, percent-decodes paths, rejects `..` path segments, maps `/`
   to `/index.html`, and emits MIME types for common web assets.
+* **Per-connection buffers** — each accepted connection owns its read/write
+  buffers, so in-flight responses do not overwrite each other.
+* **Fixed implementation caps** — `serveWithOptions` can lower limits at
+  runtime, but this ioring implementation is capped at 64 connections, 16 KiB
+  request reads, and 1 MiB response staging.
+* **Partial writes handled** — if the OS writes only part of a response, `serve`
+  submits the remaining bytes before closing the connection.
 
 ## Provenance
 
