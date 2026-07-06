@@ -23,7 +23,8 @@ serve("/var/www", 8080, 3)     # serve 3 requests then return (handy for tests)
 |--------|------|------|
 | `serve(root, port, maxRequests = 0)` | `serve/loop` | the accept/serve loop |
 | `Header`, `Request`, `Response`, `parseRequest`, `httpResponse`, URL helpers | `http` | re-exported generic HTTP layer |
-| `TcpCompletion`, `listenTcpPort`, `submitTcpRead`, `submitTcpWrite` | `serve/tcp` | transport abstraction |
+| `TcpCompletion`, `TcpOp` | `serve/tcp_types` | backend-neutral transport types |
+| `listenTcpPort`, `submitTcpRead`, `submitTcpWrite` | `serve/tcp` | transport abstraction |
 | `contentTypeFor`, `normalizeUrlPath`, `relativePath`, `staticResponse`, `serveFile` | `serve/static` | URL → file routing + content-type |
 
 `serve/http` is a compatibility umbrella that re-exports the generic `http`

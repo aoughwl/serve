@@ -4,15 +4,7 @@
 ## file directly.
 
 import std/ioring
-
-type
-  TcpOp* = enum
-    tcpRead, tcpWrite, tcpAccept
-
-  TcpCompletion* = object
-    op*: TcpOp
-    fd*: cint
-    result*: int
+import tcp_types
 
 proc initTcp*() =
   initPool()

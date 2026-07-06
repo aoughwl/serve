@@ -1,0 +1,10 @@
+## tserve_api.aowl — public API smoke test for serve.
+
+import serve
+
+var comp = TcpCompletion(op: tcpAccept, fd: 0.cint, result: 0)
+discard comp
+
+discard contentTypeFor("/tmp/index.html")
+discard normalizeUrlPath("/x?q=1")
+discard httpResponse(200, "text/plain", "ok")

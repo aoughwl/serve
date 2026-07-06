@@ -9,7 +9,7 @@
 ## API surface:
 ##   * `serve(root, port, maxRequests = 0)`  — the accept/serve loop
 ##   * generic HTTP helpers                  — re-exported from `http`
-##   * `TcpCompletion`, TCP primitives       — transport abstraction
+##   * `TcpCompletion`, TCP primitives       — transport abstraction/types
 ##   * `serveFile`, `staticResponse`         — URL->file routing (static.aowl)
 
 import http/headers
@@ -17,6 +17,7 @@ import http/url
 import http/request
 import http/response
 import serve/static
+import serve/tcp_types
 import serve/tcp
 import serve/loop
-export headers, url, request, response, static, tcp, loop
+export headers, url, request, response, static, tcp_types, tcp, loop
