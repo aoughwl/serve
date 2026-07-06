@@ -16,7 +16,8 @@
 
 import std/syncio
 import std/ioring
-import http
+import http/request
+import http/response
 import static
 
 # Module-level buffers. The CQ loop is single-threaded and connections use
@@ -46,9 +47,15 @@ proc bufToString(n: int): string =
 proc route(root: string; raw: string): string =
   ## Turn a raw request into a full HTTP response.
   let req = parseRequest(raw)
-  if req.meth != "GET":
+  if not isValidRequest(req):
+    return httpResponse(400, "text/plain", "Bad Request\n")
+  if isMethod(req, "OPTIONS"):
+    return optionsResponse("GET, HEAD, OPTIONS")
+  if isMethod(req, "HEAD"):
+    return staticResponse(root, req.path, false)
+  if not isMethod(req, "GET"):
     return httpResponse(405, "text/plain", "Method Not Allowed\n")
-  return serveFile(root, req.path)
+  return staticResponse(root, req.path, true)
 
 proc serve*(root: string; port: int; maxRequests = 0) =
   ## Serve static files under `root` on `port`. Loops forever unless
