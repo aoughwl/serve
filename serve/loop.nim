@@ -1,23 +1,20 @@
 ## serve/loop.aowl — the accept/read/write event loop.
 ##
-## Two public entry points, both on top of ONE connection loop:
+## Entry points, all on top of ONE connection core (`serveConnCore`) that reads
+## a complete request, calls the handler, and streams the response:
 ##
-##   * `serve(port, handler, maxRequests = 0)` — PROGRAMMABLE server. `handler`
-##     is a `proc(req: Request): Response {.closure.}` called once per request;
-##     whatever `Response` it returns is streamed back to the client.
-##   * `serve(root, port, maxRequests = 0)`    — the original static-file server,
-##     implemented in terms of the handler API via `staticHandler(root)`.
+##   * `serve(port, handler, maxRequests = 0)`    — PROGRAMMABLE plaintext server.
+##   * `serve(root, port, maxRequests = 0)`       — static-file server (uses
+##     `staticHandler`), on the same core.
+##   * `serveTls(port, certFile, keyFile, handler, maxRequests = 0)` — HTTPS: the
+##     same handler API, each accepted socket wrapped in a server-side TLS
+##     session (`net/tls`, OpenSSL 3) before the request/response core runs.
 ##
-## The connection loop:
-##   1. reads a COMPLETE request (headers up to CRLFCRLF, then the body per
-##      `Content-Length`), guarded by an 8 MB cap (→ 413) and a 15 s read
-##      timeout (slowloris guard);
-##   2. calls the handler;
-##   3. streams the response header, then the body in chunks straight through
-##      `writeAllTcp` (NO fixed response-size cap, so large bodies are not
-##      truncated and `Content-Length` always matches the bytes written);
-##   4. for HTTP/1.1 (or HTTP/1.0 + `Connection: keep-alive`) keeps the socket
-##      open and serves the next request, up to `MaxKeepAliveRequests`.
+## Transport independence: the request-read / response-write code operates on a
+## `ServerConn` that is either a raw `TcpHandle` or a `TlsSocket`, so the HTTP
+## logic (complete-request read with an 8 MB cap → 413, a 15 s slowloris read
+## timeout, keep-alive, HEAD, streamed unbounded response bodies) is shared byte
+## for byte between HTTP and HTTPS.
 ##
 ## nimony notes: closures need an explicit `.closure` pragma; string elements
 ## cannot be `addr`-ed, so response bytes are streamed through a stack chunk
@@ -28,6 +25,8 @@ import http/headers
 import http/request
 import http/response
 import tcp
+import net
+import net/tls
 import static
 
 const
@@ -42,10 +41,51 @@ type
     ## A request handler: takes the parsed `Request`, returns the `Response` to
     ## send. Must be `.closure` so it can capture state (e.g. a root directory).
 
-proc writeStringTcp(fd: TcpHandle; s: string): bool =
-  ## Stream an in-memory string to the socket in chunks. No size cap: this is
-  ## what replaces the old fixed 1 MB response buffer. Returns false on a short
-  ## write / socket error.
+  ServerConn* = object
+    ## The transport under one served connection: a plaintext `TcpHandle` or a
+    ## `TlsSocket`. `fd` is always the underlying descriptor (also for TLS, so
+    ## socket options like the read timeout apply to both).
+    isTls*: bool
+    fd*: TcpHandle
+    tls*: TlsSocket
+
+proc plainConn(fd: TcpHandle): ServerConn =
+  ServerConn(isTls: false, fd: fd, tls: TlsSocket(socket: invalidSocket(), ssl: nil, handshakeDone: false))
+
+proc connRead(c: var ServerConn; buf: pointer; n: int): int =
+  ## Read up to `n` bytes; <=0 means EOF/error (matching `readTcp`).
+  if c.isTls:
+    var st = tlsOk
+    return tlsReadInto(c.tls, buf, n, st)
+  return readTcp(c.fd, buf, n)
+
+proc connWriteAll(c: var ServerConn; buf: pointer; n: int): int =
+  ## Write all `n` bytes; a short return signals a socket/TLS error.
+  if not c.isTls:
+    return writeAllTcp(c.fd, buf, n)
+  var total = 0
+  var st = tlsOk
+  while total < n:
+    let p = cast[pointer](cast[uint](buf) + uint(total))
+    let w = tlsWriteFrom(c.tls, p, n - total, st)
+    if w <= 0:
+      break
+    total = total + w
+  return total
+
+proc connSetReadTimeout(c: var ServerConn; millis: int) =
+  discard setTcpReadTimeoutMillis(c.fd, millis)
+
+proc connClose(c: var ServerConn) =
+  if c.isTls:
+    c.tls.closeTls()   # sends close_notify and closes the underlying socket
+  else:
+    closeTcp(c.fd)
+
+proc writeStringConn(c: var ServerConn; s: string): bool =
+  ## Stream an in-memory string to the connection in chunks. No size cap: this
+  ## is what replaces the old fixed 1 MB response buffer. Returns false on a
+  ## short write / socket error.
   var chunk = default(array[WriteChunkBytes, char])
   var i = 0
   while i < s.len:
@@ -54,7 +94,7 @@ proc writeStringTcp(fd: TcpHandle; s: string): bool =
       chunk[n] = s[i]
       inc n
       inc i
-    if writeAllTcp(fd, addr chunk[0], n) != n:
+    if connWriteAll(c, addr chunk[0], n) != n:
       return false
   return true
 
@@ -114,7 +154,7 @@ proc keepAliveWanted(req: Request): bool =
     return not containsIgnoreCase(conn, "close")
   return containsIgnoreCase(conn, "keep-alive")
 
-proc readFullRequest(fd: TcpHandle; raw: var string; tooLarge: var bool): bool =
+proc readFullRequest(c: var ServerConn; raw: var string; tooLarge: var bool): bool =
   ## Accumulate a complete HTTP request: header block, then `Content-Length`
   ## body bytes. Returns false on EOF/error/timeout before a full request, or
   ## when the size cap is hit (with `tooLarge = true`).
@@ -138,7 +178,7 @@ proc readFullRequest(fd: TcpHandle; raw: var string; tooLarge: var bool): bool =
     if raw.len >= MaxRequestBytes:
       tooLarge = true
       return false
-    let n = readTcp(fd, addr buf[0], buf.len)
+    let n = connRead(c, addr buf[0], buf.len)
     if n <= 0:
       return false
     var k = 0
@@ -146,30 +186,30 @@ proc readFullRequest(fd: TcpHandle; raw: var string; tooLarge: var bool): bool =
       raw.add buf[k]
       inc k
 
-proc sendResponse(fd: TcpHandle; resp: Response; includeBody: bool): bool =
+proc sendResponse(c: var ServerConn; resp: Response; includeBody: bool): bool =
   ## Serialize the header block (Content-Length from the full body), then stream
   ## the body separately — avoids concatenating a second whole-response copy.
-  if not writeStringTcp(fd, responseToString(resp, false)):
+  if not writeStringConn(c, responseToString(resp, false)):
     return false
   if includeBody and resp.body.len > 0:
-    if not writeStringTcp(fd, resp.body):
+    if not writeStringConn(c, resp.body):
       return false
   return true
 
-proc serveConnection*(fd: TcpHandle; handler: Handler) =
-  ## Serve one accepted socket to completion: read → handle → write, looping for
-  ## HTTP keep-alive, then close. Exposed so tests/drivers can hand it a socket.
-  discard setTcpReadTimeoutMillis(fd, ReadTimeoutMillis)
+proc serveConnCore(c: var ServerConn; handler: Handler) =
+  ## The shared request/response loop over any `ServerConn` (plain or TLS):
+  ## read → handle → write, looping for HTTP keep-alive, then close.
+  connSetReadTimeout(c, ReadTimeoutMillis)
   var count = 0
   var alive = true
   while alive and count < MaxKeepAliveRequests:
     var raw = ""
     var tooLarge = false
-    if not readFullRequest(fd, raw, tooLarge):
+    if not readFullRequest(c, raw, tooLarge):
       if tooLarge:
         var resp = response(413, "text/plain", "Payload Too Large\n")
         resp.withHeader("Connection", "close")
-        discard sendResponse(fd, resp, true)
+        discard sendResponse(c, resp, true)
       alive = false
     else:
       let req = parseRequest(raw)
@@ -181,17 +221,33 @@ proc serveConnection*(fd: TcpHandle; handler: Handler) =
         else:
           resp.withHeader("Connection", "close")
       let includeBody = not isMethod(req, "HEAD")
-      if not sendResponse(fd, resp, includeBody):
+      if not sendResponse(c, resp, includeBody):
         alive = false
       else:
         inc count
         if not ka:
           alive = false
-  closeTcp(fd)
+  connClose(c)
+
+proc serveConnection*(fd: TcpHandle; handler: Handler) =
+  ## Serve one accepted plaintext socket to completion. Exposed so tests/drivers
+  ## can hand it a socket.
+  var c = plainConn(fd)
+  serveConnCore(c, handler)
+
+proc serveConnectionTls*(fd: TcpHandle; ctx: TlsContext; handler: Handler) =
+  ## Wrap one accepted socket in a server-side TLS session, then serve it with
+  ## the same core. Drops the connection silently if the handshake fails.
+  var sock = Socket(handle: fd)
+  var tsock = wrapServer(ctx, sock)
+  if not tsock.handshakeDone:
+    tsock.closeTls()   # closes the underlying fd too
+    return
+  var c = ServerConn(isTls: true, fd: fd, tls: tsock)
+  serveConnCore(c, handler)
 
 proc serve*(port: int; handler: Handler; maxRequests = 0) =
-  ## Run a programmable server on `port`: every request is passed to `handler`
-  ## and its returned `Response` is sent back. Loops forever unless
+  ## Run a programmable plaintext server on `port`. Loops forever unless
   ## `maxRequests > 0`, in which case it exits after that many CONNECTIONS.
   initTcp()
   let l = listenTcp(port)
@@ -209,6 +265,35 @@ proc serve*(port: int; handler: Handler; maxRequests = 0) =
   closeTcp(l)
   shutdownTcp()
   echo "served ", served, " connection(s); exiting"
+
+proc serveTls*(port: int; certFile: string; keyFile: string; handler: Handler;
+               maxRequests = 0) =
+  ## Run a programmable HTTPS server on `port`, loading a PEM certificate chain
+  ## and private key. Each accepted connection gets its own TLS session over the
+  ## shared context, then runs the same handler loop as `serve`.
+  initTcp()
+  var ctx = newTlsServerContext(certFile, keyFile)
+  if not ctx.isValid:
+    echo "failed to load TLS cert/key: ", lastTlsError()
+    shutdownTcp()
+    return
+  let l = listenTcp(port)
+  if l == InvalidTcpHandle:
+    echo "failed to listen on :", port
+    ctx.close()
+    shutdownTcp()
+    return
+  echo "serving TLS on :", port, " (fd=", l, ")"
+  var served = 0
+  while maxRequests == 0 or served < maxRequests:
+    let clientFd = acceptTcp(l)
+    if clientFd != InvalidTcpHandle:
+      serveConnectionTls(clientFd, ctx, handler)
+      inc served
+  ctx.close()
+  closeTcp(l)
+  shutdownTcp()
+  echo "served ", served, " TLS connection(s); exiting"
 
 proc staticRoute*(root: string; req: Request): Response =
   ## Route one request against a static-file `root`: validate, handle
