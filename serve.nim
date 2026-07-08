@@ -29,5 +29,6 @@ import tcp
 import net/tls
 import serve/static
 import serve/loop
-export headers, url, request, response, static, tcp, loop
+import serve/pool
+export headers, url, request, response, static, tcp, loop, pool
 export tls

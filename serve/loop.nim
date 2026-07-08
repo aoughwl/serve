@@ -41,6 +41,12 @@ type
     ## A request handler: takes the parsed `Request`, returns the `Response` to
     ## send. Must be `.closure` so it can capture state (e.g. a root directory).
 
+  NimcallHandler* = proc(req: Request): Response {.nimcall.}
+    ## A handler as a plain function pointer (no captured environment). Used by
+    ## the threaded worker pool: a bare `{.nimcall.}` proc crosses module and
+    ## thread boundaries cleanly, where a closure stored in another module's
+    ## global does not. Per-request state must come from thread-safe globals.
+
   ServerConn* = object
     ## The transport under one served connection: a plaintext `TcpHandle` or a
     ## `TlsSocket`. `fd` is always the underlying descriptor (also for TLS, so
@@ -234,6 +240,57 @@ proc serveConnection*(fd: TcpHandle; handler: Handler) =
   ## can hand it a socket.
   var c = plainConn(fd)
   serveConnCore(c, handler)
+
+proc serveConnCoreNimcall(c: var ServerConn; handler: NimcallHandler) =
+  ## Identical to `serveConnCore` but drives a `{.nimcall.}` function-pointer
+  ## handler. Duplicated rather than closure-wrapped: nimony's lambda lifter
+  ## cannot lift a closure that captures a proc-typed variable, so the worker
+  ## pool must call the bare function pointer directly.
+  connSetReadTimeout(c, ReadTimeoutMillis)
+  var count = 0
+  var alive = true
+  while alive and count < MaxKeepAliveRequests:
+    var raw = ""
+    var tooLarge = false
+    if not readFullRequest(c, raw, tooLarge):
+      if tooLarge:
+        var resp = response(413, "text/plain", "Payload Too Large\n")
+        resp.withHeader("Connection", "close")
+        discard sendResponse(c, resp, true)
+      alive = false
+    else:
+      let req = parseRequest(raw)
+      var resp = handler(req)
+      let ka = keepAliveWanted(req) and (count + 1 < MaxKeepAliveRequests)
+      if not hasHeader(resp.headers, "Connection"):
+        if ka:
+          resp.withHeader("Connection", "keep-alive")
+        else:
+          resp.withHeader("Connection", "close")
+      let includeBody = not isMethod(req, "HEAD")
+      if not sendResponse(c, resp, includeBody):
+        alive = false
+      else:
+        inc count
+        if not ka:
+          alive = false
+  connClose(c)
+
+proc serveConnectionNimcall*(fd: TcpHandle; handler: NimcallHandler) =
+  ## Serve one accepted plaintext socket with a `{.nimcall.}` handler — the
+  ## thread-safe entry the worker pool uses.
+  var c = plainConn(fd)
+  serveConnCoreNimcall(c, handler)
+
+proc serveConnectionTlsNimcall*(fd: TcpHandle; ctx: TlsContext; handler: NimcallHandler) =
+  ## TLS variant of `serveConnectionNimcall`.
+  var sock = Socket(handle: fd)
+  var tsock = wrapServer(ctx, sock)
+  if not tsock.handshakeDone:
+    tsock.closeTls()
+    return
+  var c = ServerConn(isTls: true, fd: fd, tls: tsock)
+  serveConnCoreNimcall(c, handler)
 
 proc serveConnectionTls*(fd: TcpHandle; ctx: TlsContext; handler: Handler) =
   ## Wrap one accepted socket in a server-side TLS session, then serve it with
