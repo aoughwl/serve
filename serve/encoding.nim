@@ -10,8 +10,8 @@
 import http/headers
 import http/request
 import http/response
-import http/compress
-export compress
+import http/contentcoding
+export contentcoding
 
 const MinCompressBytes = 64
 
