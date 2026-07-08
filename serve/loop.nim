@@ -160,27 +160,98 @@ proc keepAliveWanted(req: Request): bool =
     return not containsIgnoreCase(conn, "close")
   return containsIgnoreCase(conn, "keep-alive")
 
+proc hexDigit(c: char): int =
+  if c >= '0' and c <= '9': ord(c) - ord('0')
+  elif c >= 'a' and c <= 'f': ord(c) - ord('a') + 10
+  elif c >= 'A' and c <= 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc subStr(s: string; a: int; b: int): string =
+  ## Copy `s[a ..< b]` by char-walk (nimony string slices are `.raises`).
+  result = ""
+  var i = a
+  while i < b and i < s.len:
+    result.add s[i]
+    inc i
+
+proc chunkedComplete(s: string; start: int): bool =
+  ## True once the `Transfer-Encoding: chunked` body beginning at `start`
+  ## contains its terminating zero-size chunk in full. Conservatively returns
+  ## false while any chunk (size line, data, or trailing CRLF) is still partial,
+  ## so the caller keeps reading.
+  var i = start
+  while true:
+    var size = 0
+    var any = false
+    while i < s.len and hexDigit(s[i]) >= 0:
+      size = size * 16 + hexDigit(s[i])
+      any = true
+      inc i
+    if not any:
+      return false
+    while i < s.len and s[i] != '\n':
+      inc i
+    if i >= s.len:
+      return false
+    inc i                      # consume the '\n' ending the size line
+    if size == 0:
+      return true              # terminating chunk (trailers ignored)
+    if i + size > s.len:
+      return false
+    i = i + size
+    if i < s.len and s[i] == '\r': inc i
+    if i < s.len and s[i] == '\n':
+      inc i
+    else:
+      return false             # data's trailing CRLF not fully arrived yet
+
 proc readFullRequest(c: var ServerConn; raw: var string; tooLarge: var bool): bool =
-  ## Accumulate a complete HTTP request: header block, then `Content-Length`
-  ## body bytes. Returns false on EOF/error/timeout before a full request, or
-  ## when the size cap is hit (with `tooLarge = true`).
+  ## Accumulate a complete HTTP request: the header block, then the body framed
+  ## by either `Content-Length` or `Transfer-Encoding: chunked`. Honors
+  ## `Expect: 100-continue` (sends the interim 100 before reading the body). For
+  ## a chunked request the body is de-chunked in place, so the handler always
+  ## sees a plain body regardless of transfer encoding. Returns false on
+  ## EOF/error/timeout before a full request, or `tooLarge` at the size cap.
   raw = ""
   tooLarge = false
   var buf = default(array[ReadChunkBytes, char])
   var headerEnd = -1
   var contentLen = 0
+  var chunked = false
+  var expectContinue = false
+  var sentContinue = false
   while true:
     if headerEnd < 0:
       headerEnd = headerTerminator(raw)
       if headerEnd >= 0:
         let req = parseRequest(raw)
-        let cl = headerValue(req.headers, "Content-Length")
-        if cl.len > 0:
-          var v = 0
-          if parseNonNegInt(cl, v):
-            contentLen = v
-    if headerEnd >= 0 and raw.len >= headerEnd + contentLen:
-      return true
+        if containsIgnoreCase(headerValue(req.headers, "Transfer-Encoding"), "chunked"):
+          chunked = true
+        else:
+          let cl = headerValue(req.headers, "Content-Length")
+          if cl.len > 0:
+            var v = 0
+            if parseNonNegInt(cl, v):
+              contentLen = v
+        if containsIgnoreCase(headerValue(req.headers, "Expect"), "100-continue"):
+          expectContinue = true
+    # A client that sent `Expect: 100-continue` waits for the interim response
+    # before streaming its body; send it once, after the headers, before we
+    # block waiting for body bytes.
+    if headerEnd >= 0 and expectContinue and not sentContinue and (chunked or contentLen > 0):
+      discard writeStringConn(c, "HTTP/1.1 100 Continue\r\n\r\n")
+      sentContinue = true
+    if headerEnd >= 0:
+      if chunked:
+        if chunkedComplete(raw, headerEnd):
+          # Rebuild the request with the de-chunked body so the handler sees a
+          # plain body (parseRequest treats everything after the headers as body).
+          let header = subStr(raw, 0, headerEnd)
+          let body = decodeChunked(subStr(raw, headerEnd, raw.len))
+          raw = header & body
+          return true
+      elif raw.len >= headerEnd + contentLen:
+        return true
     if raw.len >= MaxRequestBytes:
       tooLarge = true
       return false
