@@ -75,18 +75,21 @@ proc relativePath*(urlPath: string): string =
     result.add p[j]
     inc j
 
-proc staticResponse*(root: string; urlPath: string; includeBody = true): string =
-  ## Route a URL path to a file under `root` and return a full HTTP response.
+proc staticResponseObj*(root: string; urlPath: string): Response =
+  ## Route a URL path to a file under `root` and return the in-memory `Response`
+  ## model (status, headers, and full body). The transport layer decides how to
+  ## serialize it (e.g. omitting the body for `HEAD`). This is the object-model
+  ## core that both `staticResponse` and the handler-based loop build on.
   let p = normalizeUrlPath(urlPath)
   if hasDotDot(p):
-    return httpResponse(403, "text/plain", "Forbidden\n")
+    return response(403, "text/plain", "Forbidden\n")
 
   var full = root & "/" & relativePath(p)
   if dirExists(full):
     full = full & "/index.html"
 
   if not fileExists(full):
-    return httpResponse(404, "text/plain", "Not Found\n")
+    return response(404, "text/plain", "Not Found\n")
 
   var body = ""
   var ok = true
@@ -95,11 +98,15 @@ proc staticResponse*(root: string; urlPath: string; includeBody = true): string 
   except:
     ok = false
   if not ok:
-    return httpResponse(500, "text/plain", "Internal Server Error\n")
+    return response(500, "text/plain", "Internal Server Error\n")
 
-  var res = response(200, contentTypeFor(full), body)
-  res.withHeader("X-Content-Type-Options", "nosniff")
-  return responseToString(res, includeBody)
+  result = response(200, contentTypeFor(full), body)
+  result.withHeader("X-Content-Type-Options", "nosniff")
+
+proc staticResponse*(root: string; urlPath: string; includeBody = true): string =
+  ## Route a URL path to a file under `root` and return a full HTTP response
+  ## string. Thin wrapper over `staticResponseObj`.
+  responseToString(staticResponseObj(root, urlPath), includeBody)
 
 proc serveFile*(root: string; urlPath: string): string =
   ## Backwards-compatible static GET helper.
