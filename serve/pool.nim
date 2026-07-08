@@ -19,7 +19,7 @@
 import std/syncio
 import std/rawthreads
 import tcp
-import net/tls
+import tls
 import loop
 
 const MaxWorkers* = 256

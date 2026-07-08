@@ -26,7 +26,7 @@ import http/url
 import http/request
 import http/response
 import tcp
-import net/tls
+import tls
 import serve/static
 import serve/loop
 import serve/pool

@@ -21,7 +21,7 @@ import http/request
 import http/response
 import tcp
 import net
-import net/tls
+import tls
 
 const nghttp2Lib = "libnghttp2.so.14"
 

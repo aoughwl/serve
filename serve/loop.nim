@@ -8,7 +8,7 @@
 ##     `staticHandler`), on the same core.
 ##   * `serveTls(port, certFile, keyFile, handler, maxRequests = 0)` — HTTPS: the
 ##     same handler API, each accepted socket wrapped in a server-side TLS
-##     session (`net/tls`, OpenSSL 3) before the request/response core runs.
+##     session (`tls`, OpenSSL 3) before the request/response core runs.
 ##
 ## Transport independence: the request-read / response-write code operates on a
 ## `ServerConn` that is either a raw `TcpHandle` or a `TlsSocket`, so the HTTP
@@ -26,7 +26,7 @@ import http/request
 import http/response
 import tcp
 import net
-import net/tls
+import tls
 import static
 
 const

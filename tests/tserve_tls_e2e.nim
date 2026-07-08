@@ -2,7 +2,7 @@
 ##
 ## Generates a throwaway self-signed cert, runs the ACTUAL TLS server path
 ## (`serveConnectionTls`, same code `serveTls` uses) on a background thread bound
-## to an ephemeral port, and drives a real TLS client (our own `net/tls`) on the
+## to an ephemeral port, and drives a real TLS client (our own `tls`) on the
 ## main thread over an encrypted connection.
 ##
 ## Assertions:

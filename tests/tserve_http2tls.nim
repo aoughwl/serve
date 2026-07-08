@@ -10,7 +10,7 @@ import std/rawthreads
 import serve
 import serve/http2
 import net
-import net/tls
+import tls
 
 const
   certPath = "/tmp/aoughwl_h2_cert.pem"
