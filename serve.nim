@@ -30,5 +30,6 @@ import net/tls
 import serve/static
 import serve/loop
 import serve/pool
+import serve/encoding
 export headers, url, request, response, static, tcp, loop, pool
-export tls
+export tls, encoding
