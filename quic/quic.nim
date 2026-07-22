@@ -33,6 +33,12 @@ proc aqClientPost(c: QuicCtx; body: cstring; len: cint): cint
   {.importc: "aq_client_post", dynlib: lib.}
 proc aqRequestBody(c: QuicCtx; reqId: uint64; buf: ptr char; cap: cint): cint
   {.importc: "aq_request_body", dynlib: lib.}
+proc aqTakeDatagram(c: QuicCtx; buf: ptr char; cap: cint; connToken: ptr uint64): cint
+  {.importc: "aq_take_datagram", dynlib: lib.}
+proc aqSendDatagram(c: QuicCtx; connToken: uint64; data: ptr char; len: cint): cint
+  {.importc: "aq_send_datagram", dynlib: lib.}
+proc aqClientSendDatagram(c: QuicCtx; data: ptr char; len: cint): cint
+  {.importc: "aq_client_send_datagram", dynlib: lib.}
 proc aqClientDone(c: QuicCtx): cint {.importc: "aq_client_done", dynlib: lib.}
 proc aqClientStatus(c: QuicCtx): cint {.importc: "aq_client_status", dynlib: lib.}
 proc aqClientBody(c: QuicCtx; buf: ptr char; cap: cint): cint
@@ -123,3 +129,45 @@ proc clientBody*(c: QuicCtx; maxLen = 1 shl 20): string =
   while i < n:
     result.add buf[i]
     inc i
+
+# ---- RFC 9221 unreliable datagrams ----------------------------------------
+type Datagram* = object
+  ok*: bool
+  connToken*: uint64     ## which connection it arrived on (for a reply)
+  data*: string
+
+proc takeDatagram*(c: QuicCtx; maxLen = 65535): Datagram =
+  ## Pull one received QUIC datagram (or `ok = false` if none pending).
+  result = default(Datagram)
+  var buf = newSeq[char](maxLen)
+  var tok = 0'u64
+  let n = aqTakeDatagram(c, addr buf[0], cint(maxLen), addr tok)
+  if n > 0:
+    result.ok = true
+    result.connToken = tok
+    result.data = ""
+    var i = 0
+    while i < n:
+      result.data.add buf[i]
+      inc i
+
+proc sendDatagram*(c: QuicCtx; connToken: uint64; data: string) =
+  ## Queue an unreliable datagram on the connection `connToken` (from a received
+  ## `Datagram`). Sent on the next flush.
+  if data.len == 0: return
+  var buf = newSeq[char](data.len)
+  var i = 0
+  while i < data.len:
+    buf[i] = data[i]
+    inc i
+  discard aqSendDatagram(c, connToken, addr buf[0], cint(buf.len))
+
+proc clientSendDatagram*(c: QuicCtx; data: string) =
+  ## Queue an unreliable datagram on a client's single connection.
+  if data.len == 0: return
+  var buf = newSeq[char](data.len)
+  var i = 0
+  while i < data.len:
+    buf[i] = data[i]
+    inc i
+  discard aqClientSendDatagram(c, addr buf[0], cint(buf.len))

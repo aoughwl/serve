@@ -8,3 +8,5 @@ quic/test_quic
 quic/test_quic_asan
 quic/*.pem
 quic/*.o
+quic/test_dgram
+quic/test_dgram_asan

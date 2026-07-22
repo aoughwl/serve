@@ -77,6 +77,7 @@ typedef struct Conn {
   struct sockaddr_storage local;  socklen_t locallen;
   Stream streams[MAX_STREAMS];
   int64_t ctrl_id, qpack_enc_id, qpack_dec_id;
+  char *odg[8]; int odg_len[8]; int odg_head, odg_n;   /* outgoing datagrams */
 } Conn;
 
 /* ---- CID -> Conn routing table ---------------------------------------- */
@@ -103,6 +104,8 @@ typedef struct aq_ctx {
   char *cli_body; int cli_body_len;
   int64_t cli_stream;
   int cli_done;
+  /* incoming datagrams (from any connection) */
+  struct { int conn_idx; char *data; int len; int used; } idg[128];
 } aq_ctx;
 
 /* ====================================================================== */
@@ -356,6 +359,29 @@ static int ng_extend_max_remote_bidi(ngtcp2_conn *conn, uint64_t max_streams,
   (void)conn; (void)max_streams; (void)user_data; return 0;
 }
 
+static int conn_index(aq_ctx *c, Conn *cn) {
+  for (int i = 0; i < MAX_CONNS; i++) if (&c->conns[i] == cn) return i;
+  return -1;
+}
+
+static int ng_recv_datagram(ngtcp2_conn *conn, uint32_t flags,
+                            const uint8_t *data, size_t datalen, void *user_data) {
+  (void)conn; (void)flags;
+  Conn *cn = user_data;
+  aq_ctx *c = cn->ctx;
+  for (int i = 0; i < 128; i++) {
+    if (!c->idg[i].used) {
+      c->idg[i].used = 1;
+      c->idg[i].conn_idx = conn_index(c, cn);
+      c->idg[i].data = malloc(datalen > 0 ? datalen : 1);
+      memcpy(c->idg[i].data, data, datalen);
+      c->idg[i].len = (int)datalen;
+      break;
+    }
+  }
+  return 0;
+}
+
 static void fill_callbacks(ngtcp2_callbacks *cb, int server) {
   memset(cb, 0, sizeof(*cb));
   cb->recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
@@ -376,6 +402,7 @@ static void fill_callbacks(ngtcp2_callbacks *cb, int server) {
   cb->get_new_connection_id = ng_get_new_cid;
   cb->remove_connection_id = ng_remove_cid;
   cb->extend_max_remote_streams_bidi = ng_extend_max_remote_bidi;
+  cb->recv_datagram = ng_recv_datagram;
   if (server) {
     cb->recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
   } else {
@@ -393,6 +420,7 @@ static void default_tp(ngtcp2_transport_params *p) {
   p->initial_max_stream_data_uni = 256 * 1024;
   p->initial_max_data = 1024 * 1024;
   p->max_idle_timeout = 30 * NGTCP2_SECONDS;
+  p->max_datagram_frame_size = 65535;   /* RFC 9221 unreliable datagrams */
 }
 
 /* ====================================================================== */
@@ -547,6 +575,7 @@ static void conn_close(aq_ctx *c, Conn *cn) {
     if (cn->streams[i].rbody) free(cn->streams[i].rbody);
     if (cn->streams[i].sbody) free(cn->streams[i].sbody);
   }
+  for (int i = 0; i < 8; i++) if (cn->odg[i]) { free(cn->odg[i]); cn->odg[i] = NULL; }
   cn->used = 0;
 }
 
@@ -586,6 +615,26 @@ static int conn_write(aq_ctx *c, Conn *cn) {
     if (nwrite == 0) break;   /* nothing more to send right now */
     sendto(c->fd, buf, (size_t)nwrite, 0,
            (struct sockaddr *)&cn->remote, cn->remotelen);
+  }
+  /* drain queued outgoing datagrams (only once the handshake can carry them) */
+  while (cn->handshake_done && cn->odg_n > 0) {
+    int h = cn->odg_head;
+    ngtcp2_vec v; v.base = (uint8_t *)cn->odg[h]; v.len = (size_t)cn->odg_len[h];
+    int accepted = 0;
+    ngtcp2_ssize nw = ngtcp2_conn_writev_datagram(
+        cn->conn, &path, &pi, buf, sizeof(buf), &accepted,
+        NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &v, 1, ts);
+    if (nw < 0) break;
+    if (nw > 0)
+      sendto(c->fd, buf, (size_t)nw, 0,
+             (struct sockaddr *)&cn->remote, cn->remotelen);
+    if (accepted) {
+      free(cn->odg[h]); cn->odg[h] = NULL;
+      cn->odg_head = (h + 1) % 8; cn->odg_n--;
+    } else {
+      break;   /* congestion/flow limited — retry on the next write */
+    }
+    if (nw == 0) break;
   }
   return 0;
 }
@@ -818,6 +867,39 @@ int aq_request_body(aq_ctx *c, uint64_t req_id, char *buf, int cap) {
   int n = s->rbody_len < cap ? s->rbody_len : cap;
   memcpy(buf, s->rbody, n);
   return n;
+}
+
+static int enqueue_dgram(Conn *cn, const char *data, int len) {
+  if (cn->odg_n >= 8) return -1;
+  int slot = (cn->odg_head + cn->odg_n) % 8;
+  cn->odg[slot] = malloc(len > 0 ? len : 1);
+  if (len > 0) memcpy(cn->odg[slot], data, len);
+  cn->odg_len[slot] = len; cn->odg_n++;
+  return 0;
+}
+
+int aq_take_datagram(aq_ctx *c, char *buf, int cap, uint64_t *conn_token) {
+  for (int i = 0; i < 128; i++) {
+    if (c->idg[i].used) {
+      int n = c->idg[i].len < cap ? c->idg[i].len : cap;
+      memcpy(buf, c->idg[i].data, n);
+      *conn_token = (uint64_t)c->idg[i].conn_idx;
+      free(c->idg[i].data); c->idg[i].data = NULL; c->idg[i].used = 0;
+      return n;
+    }
+  }
+  return 0;
+}
+
+int aq_send_datagram(aq_ctx *c, uint64_t conn_token, const char *data, int len) {
+  if (conn_token >= MAX_CONNS || !c->conns[conn_token].used) return -1;
+  return enqueue_dgram(&c->conns[conn_token], data, len);
+}
+
+int aq_client_send_datagram(aq_ctx *c, const char *data, int len) {
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (c->conns[i].used) return enqueue_dgram(&c->conns[i], data, len);
+  return -1;
 }
 
 int aq_client_done(aq_ctx *c) {
