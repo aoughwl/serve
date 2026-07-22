@@ -1,14 +1,29 @@
-## serve/reactorws.nim — an async WebSocket (RFC 6455) server on the reactor.
+## serve/reactorws.nim — an async, RFC 6455-conformant WebSocket server on the
+## reactor.
 ##
 ## One thread, epoll-multiplexed: each connection is a flat coroutine that reads
-## the HTTP Upgrade request, completes the server handshake, then runs a frame
-## loop — decoding client frames incrementally, reassembling fragmented
-## messages, auto-answering ping/close, and sending the handler's reply — all
-## suspending on socket readiness (asyncio templates) rather than blocking.
+## the HTTP Upgrade request, completes the server handshake (negotiating
+## permessage-deflate when offered), then runs a frame loop that is Autobahn-grade
+## strict:
+##
+##   * every client frame must be masked (else Close 1002);
+##   * RSV2/RSV3 always illegal, RSV1 only on the first frame of a data message
+##     and only when permessage-deflate was negotiated (else 1002);
+##   * reserved opcodes (3..7, 0xB..0xF) are refused (1002);
+##   * control frames must be FIN and <= 125 bytes (1002);
+##   * a proper fragmentation state machine (continuation only mid-message, no new
+##     data frame mid-message);
+##   * text payloads are UTF-8 validated incrementally as fragments arrive, and a
+##     Close reason is validated too (bad UTF-8 -> Close 1007);
+##   * Close frames have their status code validated and echoed (1002 on a bad
+##     code, empty echo on an empty Close);
+##   * ping -> pong automatically; permessage-deflate compress/inflate per message
+##     (no_context_takeover).
 ##
 ## The frame decoder is buffer-based (`tryDecodeFrame`): the ws package only
 ## ships a transport-coupled reader, so async needs its own incremental one.
-## Encoding and the handshake reuse the ws package.
+## Encoding, the handshake, the UTF-8/close-code predicates, and the deflate codec
+## all reuse the ws package.
 
 when defined(nimony):
   {.feature: "lenientnils".}
@@ -19,18 +34,27 @@ import ./asyncio
 import http/request
 import ws/frame
 import ws/handshake
+import ws/protocol
+import ws/deflate
 
 type
   WsHandler* = proc(msg: string; isBinary: bool): string {.nimcall.}
     ## Given a complete received message, return a reply to send back
     ## (empty string = send nothing). Ping/pong/close are handled automatically.
 
+  DecodedFrame = object
+    op: int
+    payload: string
+    fin, rsv1, rsv2, rsv3, masked: bool
+    consumed: int
+
 const ReadChunk = 4096
+const MaxMessage = 64 * 1024 * 1024   # reassembly cap -> Close 1009 past this
 
 var gWsHandler: nil WsHandler = nil
 
 # ---------------------------------------------------------------------------
-# incremental frame decoding (pure; RFC 6455)
+# small pure helpers
 # ---------------------------------------------------------------------------
 
 proc subStr(s: string; a, b: int): string =
@@ -48,17 +72,32 @@ proc headerEndOf(raw: string): int =
     inc i
   return -1
 
-proc tryDecodeFrame(buf: string; opOut: var int; payload: var string;
-                    finOut: var bool; consumed: var int): int =
-  ## 1 = one full frame decoded (opOut/payload/finOut/consumed set),
-  ## 0 = incomplete (need more bytes), -1 = protocol error.
+proc closePayload(code: int; reason: string): string =
+  ## 2-byte big-endian status code + optional UTF-8 reason. code <= 0 => empty.
+  result = ""
+  if code <= 0:
+    return result
+  result.add char((code shr 8) and 0xff)
+  result.add char(code and 0xff)
+  result.add reason
+
+# ---------------------------------------------------------------------------
+# incremental frame decoding (pure; RFC 6455 §5.2)
+# ---------------------------------------------------------------------------
+
+proc tryDecodeFrame(buf: string; f: var DecodedFrame): int =
+  ## 1 = one full frame decoded into `f`, 0 = incomplete (need more bytes),
+  ## -1 = framing error (oversized 64-bit length with the high bit set).
   let n = buf.len
   if n < 2: return 0
   let b0 = uint8(ord(buf[0]))
   let b1 = uint8(ord(buf[1]))
-  finOut = (b0 and 0x80'u8) != 0'u8
-  opOut = int(b0 and 0x0f'u8)
-  let masked = (b1 and 0x80'u8) != 0'u8
+  f.fin = (b0 and 0x80'u8) != 0'u8
+  f.rsv1 = (b0 and 0x40'u8) != 0'u8
+  f.rsv2 = (b0 and 0x20'u8) != 0'u8
+  f.rsv3 = (b0 and 0x10'u8) != 0'u8
+  f.op = int(b0 and 0x0f'u8)
+  f.masked = (b1 and 0x80'u8) != 0'u8
   let len7 = int(b1 and 0x7f'u8)
   var hdr = 2
   var plen = len7
@@ -68,6 +107,9 @@ proc tryDecodeFrame(buf: string; opOut: var int; payload: var string;
     hdr = 4
   elif len7 == 127:
     if n < 10: return 0
+    # The high bit of a 64-bit length MUST be 0 (RFC 6455 §5.2); reject if set.
+    if (uint8(ord(buf[2])) and 0x80'u8) != 0'u8:
+      return -1
     plen = 0
     var k = 0
     while k < 8:
@@ -75,7 +117,7 @@ proc tryDecodeFrame(buf: string; opOut: var int; payload: var string;
       inc k
     hdr = 10
   var maskKey = [0'u8, 0'u8, 0'u8, 0'u8]
-  if masked:
+  if f.masked:
     if n < hdr + 4: return 0
     var m = 0
     while m < 4:
@@ -83,23 +125,24 @@ proc tryDecodeFrame(buf: string; opOut: var int; payload: var string;
       inc m
     hdr = hdr + 4
   if n < hdr + plen: return 0
-  payload = ""
+  f.payload = ""
   var p = 0
   while p < plen:
     var c = uint8(ord(buf[hdr + p]))
-    if masked:
+    if f.masked:
       c = c xor maskKey[p and 3]
-    payload.add char(c)
+    f.payload.add char(c)
     inc p
-  consumed = hdr + plen
+  f.consumed = hdr + plen
   return 1
 
 # ---------------------------------------------------------------------------
 # send helper (template: inlines its suspend into the calling coroutine)
 # ---------------------------------------------------------------------------
 
-template awaitSendFrame(r: Reactor; fd: cint; op: Opcode; payload: string; okOut: var bool) =
-  let frameStr = encodeFrame(op, payload, true, false, [0'u8, 0'u8, 0'u8, 0'u8])
+template awaitSendFrame(r: Reactor; fd: cint; op: Opcode; payload: string;
+                        okOut: var bool; rsv1 = false) =
+  let frameStr = encodeFrame(op, payload, true, false, [0'u8, 0'u8, 0'u8, 0'u8], rsv1)
   var sbuf = newSeq[char](frameStr.len)
   var si = 0
   while si < frameStr.len:
@@ -118,6 +161,7 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
   var buf = default(array[ReadChunk, char])
   var inbuf = ""
   var alive = true
+  var useDeflate = false
 
   # --- read the HTTP Upgrade request (until end of headers) ---------------
   var hEnd = -1
@@ -141,8 +185,9 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
     if not isWebSocketUpgrade(req):
       alive = false
     else:
+      useDeflate = requestOffersDeflate(req)
       inbuf = subStr(inbuf, hEnd, inbuf.len)   # any bytes past headers
-      let resp = serverHandshakeResponse(websocketKey(req))
+      let resp = serverHandshakeResponse(websocketKey(req), useDeflate)
       var sbuf = newSeq[char](resp.len)
       var si = 0
       while si < resp.len:
@@ -157,16 +202,20 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
         alive = false
 
   # --- frame loop ---------------------------------------------------------
-  var msg = ""
-  var msgBinary = false
+  # message-assembly state
+  var msg = ""                 # reassembled payload (all fragments)
+  var fragOpcode = -1          # -1 = idle, else 1 (text) or 2 (binary) in progress
+  var msgIsText = false
+  var msgCompressed = false
+  var utf8State = Utf8Accept   # incremental UTF-8 state for uncompressed text
+  var pendingClose = -1        # >=0 => send this Close code then stop
+  var pendingReason = ""
+
   while alive:
-    var op = 0
-    var payload = ""
-    var fin = false
-    var consumed = 0
-    let rc = tryDecodeFrame(inbuf, op, payload, fin, consumed)
+    var f = default(DecodedFrame)
+    let rc = tryDecodeFrame(inbuf, f)
     if rc < 0:
-      alive = false
+      pendingClose = CloseProtocolError
     elif rc == 0:
       # need more bytes
       var n = 0
@@ -179,32 +228,128 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
           inbuf.add buf[k]
           inc k
     else:
-      inbuf = subStr(inbuf, consumed, inbuf.len)
-      if op == 0x8:            # close: echo the peer's close code (RFC 6455 §5.5.1)
+      inbuf = subStr(inbuf, f.consumed, inbuf.len)
+      let isControl = f.op >= 0x8
+
+      # ---- frame-level validation (any failure -> Close 1002) ------------
+      if not f.masked:
+        pendingClose = CloseProtocolError          # client frames must be masked
+      elif f.rsv2 or f.rsv3:
+        pendingClose = CloseProtocolError          # no extension defines RSV2/3
+      elif f.rsv1 and (isControl or f.op == 0x0 or not useDeflate):
+        # RSV1 only legal on the first frame of a data message under deflate.
+        pendingClose = CloseProtocolError
+      elif isControl and ((not f.fin) or f.payload.len > 125):
+        pendingClose = CloseProtocolError          # control frames: FIN, <=125
+      elif (f.op >= 0x3 and f.op <= 0x7) or f.op >= 0xB:
+        pendingClose = CloseProtocolError          # reserved opcodes
+
+      # ---- control frames -----------------------------------------------
+      elif f.op == 0x8:                            # close
+        # validate the peer's close code / reason, then echo.
+        var echoCode = CloseNormal
+        var echoReason = ""
+        if f.payload.len == 1:
+          echoCode = CloseProtocolError            # 1-byte body is illegal
+        elif f.payload.len >= 2:
+          let code = (int(uint8(ord(f.payload[0]))) shl 8) or int(uint8(ord(f.payload[1])))
+          let reason = subStr(f.payload, 2, f.payload.len)
+          if not isValidCloseCode(code):
+            echoCode = CloseProtocolError
+          elif not validateUtf8(reason):
+            echoCode = CloseInvalidPayload          # bad UTF-8 in reason -> 1007
+          else:
+            echoCode = code
+            echoReason = reason
+        else:
+          echoCode = -1                             # empty Close -> empty echo
         var ok = false
-        r.awaitSendFrame(fd, opClose, payload, ok)
+        r.awaitSendFrame(fd, opClose, closePayload(echoCode, echoReason), ok)
         alive = false
-      elif op == 0x9:          # ping -> pong
+
+      elif f.op == 0x9:                            # ping -> pong (echo payload)
         var ok = false
-        r.awaitSendFrame(fd, opPong, payload, ok)
+        r.awaitSendFrame(fd, opPong, f.payload, ok)
         if not ok: alive = false
-      elif op == 0xA:          # pong -> ignore
+
+      elif f.op == 0xA:                            # pong -> ignore
         discard
-      else:                    # continuation(0) / text(1) / binary(2)
-        if op == 0x1:
-          msgBinary = false
-        elif op == 0x2:
-          msgBinary = true
-        msg.add payload
-        if fin:
-          let reply = gWsHandler(msg, msgBinary)
-          msg = ""
-          if reply.len > 0:
-            var replyOp = opText
-            if msgBinary: replyOp = opBinary
-            var ok = false
-            r.awaitSendFrame(fd, replyOp, reply, ok)
-            if not ok: alive = false
+
+      # ---- data frames (text / binary / continuation) -------------------
+      else:
+        var protoErr = false
+        if f.op == 0x1 or f.op == 0x2:
+          if fragOpcode != -1:
+            protoErr = true                         # new data frame mid-message
+          else:
+            msgIsText = (f.op == 0x1)
+            msgCompressed = f.rsv1
+            msg = ""
+            utf8State = Utf8Accept
+            if not f.fin:
+              fragOpcode = f.op
+        else:                                       # continuation (op 0)
+          if fragOpcode == -1:
+            protoErr = true                         # continuation with no message
+
+        if protoErr:
+          pendingClose = CloseProtocolError
+        elif msg.len + f.payload.len > MaxMessage:
+          pendingClose = CloseMessageTooBig
+        else:
+          msg.add f.payload
+          # incremental UTF-8 check for uncompressed text, as bytes arrive.
+          var badUtf8 = false
+          if msgIsText and (not msgCompressed):
+            var i = 0
+            while i < f.payload.len:
+              utf8State = utf8Step(utf8State, uint8(ord(f.payload[i])))
+              if utf8State == Utf8Reject:
+                badUtf8 = true
+                i = f.payload.len
+              else:
+                inc i
+          if badUtf8:
+            pendingClose = CloseInvalidPayload
+          elif f.fin:
+            fragOpcode = -1
+            # finalize the message
+            var body = msg
+            var deliver = true
+            if msgCompressed:
+              let inf = inflateMessage(body, MaxMessage)
+              if not inf.ok:
+                pendingClose = CloseInvalidPayload
+                deliver = false
+              else:
+                body = inf.data
+                if msgIsText and (not validateUtf8(body)):
+                  pendingClose = CloseInvalidPayload
+                  deliver = false
+            elif msgIsText and utf8State != Utf8Accept:
+              pendingClose = CloseInvalidPayload     # truncated multibyte at FIN
+              deliver = false
+            if deliver:
+              let reply = gWsHandler(body, not msgIsText)
+              if reply.len > 0:
+                var replyOp = opText
+                if not msgIsText: replyOp = opBinary
+                var outPayload = reply
+                var replyRsv1 = false
+                if useDeflate:
+                  let df = deflateMessage(reply)
+                  if df.ok:
+                    outPayload = df.data
+                    replyRsv1 = true
+                var ok = false
+                r.awaitSendFrame(fd, replyOp, outPayload, ok, replyRsv1)
+                if not ok: alive = false
+
+      # ---- a queued protocol failure: send Close then stop --------------
+      if pendingClose >= 0 and alive:
+        var ok = false
+        r.awaitSendFrame(fd, opClose, closePayload(pendingClose, pendingReason), ok)
+        alive = false
 
   r.unregister(fd)
   closeTcp(fd)
