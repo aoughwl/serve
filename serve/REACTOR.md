@@ -84,10 +84,24 @@ per connection, all multiplexed on one OS thread:
   (`ws` package), then runs a frame loop with an incremental buffer-based
   decoder (`tryDecodeFrame`) — the `ws` package only ships a transport-coupled
   reader, so async needs its own — reassembling fragments and auto-answering
-  ping/close. *Verified: RFC 6455 handshake + masked-frame echo, 40 simultaneous
-  clients (160/160) on one thread* (`tests/reactor_ws_e2e.sh`).
+  ping/close. **Autobahn-grade conformance**: masked-frame enforcement, RSV /
+  reserved-opcode / control-frame validation, a fragmentation state machine,
+  incremental UTF-8 validation of text (Höhrmann DFA in `ws/protocol`, Close 1007
+  on invalid), close-code validation + echo (Close 1002), and permessage-deflate.
+  *Verified: 160/160 echo across 40 clients (`tests/reactor_ws_e2e.sh`) plus 19/19
+  conformance cases (`tests/reactor_ws_conformance.sh`) on one thread.*
+- **`serve/reactorh3.nim`** — async **HTTP/3 (QUIC)**.
+  `serveH3Reactor(port, cert, key, handler)` where `handler` is `proc(meth, path,
+  body: string): H3Response`. The QUIC transport, TLS 1.3 handshake, connection-ID
+  routing, timers, and the HTTP/3 (QPACK) layer live in the `quic/quicglue.c`
+  glue shim (compiled against system **ngtcp2 + nghttp3 + GnuTLS**; build with
+  `quic/build.sh`), exposed to nimony through a small pull-based API
+  (`quic/quic.nim`). The reactor owns only the epoll wait on the single UDP fd,
+  feeding datagram readiness and QUIC timer expiries into the shim. GET + POST.
+  *Verified: 20 independent QUIC clients (20/20) on one thread*
+  (`tests/reactor_h3_e2e.sh`); the pure-C harness is ASan/LSan-clean.
 
-Both use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
+Both TCP servers use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
 than a captured closure, which composes cleanly across the coroutine boundary,
 and flag-based control flow throughout (no `break`/`return` beside a `suspend`).
 
