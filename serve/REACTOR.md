@@ -66,3 +66,31 @@ proc echoConn(r: Reactor; fd: cint) {.passive.} =
 ```
 
 See `examples/reactor_echo.nim` for the full accept loop and driver.
+
+## Async servers built on the reactor
+
+The reactor is the async backbone for real protocols, each one flat coroutine
+per connection, all multiplexed on one OS thread:
+
+- **`serve/reactorhttp.nim`** — async **HTTP/1.1**. `serveHttpReactor(port,
+  handler)` where `handler` is a `{.nimcall.}` `proc(req: Request): Response`.
+  Reads a full request (Content-Length or chunked), runs the handler, writes the
+  response, loops for keep-alive. Reuses the `http` package's parse/serialize.
+  *Verified: 60 simultaneous keep-alive conns × 5 requests (300/300) on one
+  thread* (`tests/reactor_http_e2e.sh`).
+- **`serve/reactorws.nim`** — async **WebSocket (RFC 6455)**.
+  `serveWsReactor(port, handler)` where `handler` is `proc(msg: string;
+  isBinary: bool): string`. Reads the Upgrade request, completes the handshake
+  (`ws` package), then runs a frame loop with an incremental buffer-based
+  decoder (`tryDecodeFrame`) — the `ws` package only ships a transport-coupled
+  reader, so async needs its own — reassembling fragments and auto-answering
+  ping/close. *Verified: RFC 6455 handshake + masked-frame echo, 40 simultaneous
+  clients (160/160) on one thread* (`tests/reactor_ws_e2e.sh`).
+
+Both use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
+than a captured closure, which composes cleanly across the coroutine boundary,
+and flag-based control flow throughout (no `break`/`return` beside a `suspend`).
+
+The blocking worker-pool servers (`serve/loop.nim`, `serve/pool.nim`) remain for
+callers that want thread-per-connection; the reactor variants are the
+single-thread-multiplexing alternative for high connection counts.
