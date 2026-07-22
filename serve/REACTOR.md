@@ -1,0 +1,68 @@
+# The reactor — single-threaded async for the aoughwl net stack
+
+`serve/reactor.nim` + `serve/asyncio.nim` add a single-threaded, epoll-driven
+async model to the net stack, built on Nimony's **passive procs** (continuation
+coroutines) and our own epoll primitive (`tcp/epoll.nim`). One OS thread
+multiplexes thousands of connections — the alternative to the blocking
+worker-pool model in `serve/loop.nim` + `serve/pool.nim`.
+
+Verified: `tests/reactor_e2e.sh` serves **100 simultaneous connections × 3
+rounds (300/300 echoes) on exactly one OS thread.**
+
+## How it fits together
+
+- **`tcp/epoll.nim`** — our own thin epoll(7) binding (the net stack owns no
+  epoll otherwise, only `poll`). `epollCreate/Add/Mod/Del/Wait`, an `EventBuf`.
+- **`serve/reactor.nim`** — the scheduler. A `Reactor` owns the epoll fd and a
+  `Table[fd, Continuation]` of parked coroutines. `run()` calls `epoll_wait` and,
+  for each ready fd, `complete()`s the parked continuation. `spawn(delay(call))`
+  launches a coroutine and drives it to its first park.
+- **`serve/asyncio.nim`** — `awaitAccept` / `awaitRead` / `awaitWriteAll`. Each
+  tries a nonblocking syscall and, on EAGAIN, parks the calling coroutine against
+  the fd and `suspend()`s. The reactor resumes it on readiness.
+
+The seam with the language is standard: `delay()` reifies a coroutine's
+continuation, `suspend()` parks it, `complete()` drives it. The language hands us
+suspendable continuations; the reactor is the scheduler that epoll drives.
+
+## Why the await primitives are templates, not procs
+
+This is the load-bearing design decision, forced by two defects in the current
+Nimony coroutine transform (`hexer/coro_transform.nim`). Both are worked around
+here; both are worth filing against the fork.
+
+**1. A caller looping over a suspending callee corrupts the coroutine frame.**
+If `handler()` (a passive proc) loops calling `asyncRead()` (a passive proc that
+suspends internally), the callee either busy-loops instead of parking or the
+frame is double-freed (`mimalloc: double free detected`). A *single flat
+coroutine* that owns its own suspend loop works correctly. So the await
+primitives are **templates**: they inline their read/accept/write-and-suspend
+loop into the calling coroutine, keeping every suspend point in one flat
+coroutine. (This is the same class of bug hashi's CPS briefings describe.)
+
+**2. `break`/`return` in the same branch as a `suspend` crashes the transform.**
+An `if/elif/else` (or nested `if/else`) branch that does `break`/`return` and
+also, in a sibling branch, `suspend()` crashes goto-lowering
+(`[Bug] expected ')'` in `trGoto`). So the templates carry loop exit in a
+`done`/`failed` flag on the `while` condition rather than `break`ing out of a
+branch that suspends.
+
+Both rules are mechanical and local; the resulting code is plain. When the
+transform is fixed, the templates can become ordinary passive procs unchanged.
+
+## Using it
+
+```nim
+proc echoConn(r: Reactor; fd: cint) {.passive.} =
+  var buf = default(array[4096, char])
+  while true:
+    var n = 0
+    r.awaitRead(fd, addr buf[0], 4096, n)
+    if n <= 0: break
+    var ok = false
+    r.awaitWriteAll(fd, addr buf[0], n, ok)
+    if not ok: break
+  r.unregister(fd); closeTcp(fd)
+```
+
+See `examples/reactor_echo.nim` for the full accept loop and driver.
