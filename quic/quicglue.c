@@ -54,6 +54,7 @@ typedef struct {
   int queued;            /* pushed to the request queue */
   char method[16]; int method_len;
   char path[512];  int path_len;
+  char protocol[24]; int protocol_len;   /* extended-CONNECT :protocol */
   int status;            /* client: response status */
   /* request/response body buffer (recv on server, recv on client) */
   char *rbody; int rbody_len; int rbody_cap;
@@ -77,6 +78,7 @@ typedef struct Conn {
   struct sockaddr_storage local;  socklen_t locallen;
   Stream streams[MAX_STREAMS];
   int64_t ctrl_id, qpack_enc_id, qpack_dec_id;
+  int wt_active; int64_t wt_session;     /* WebTransport session (server) */
   char *odg[8]; int odg_len[8]; int odg_head, odg_n;   /* outgoing datagrams */
 } Conn;
 
@@ -104,6 +106,7 @@ typedef struct aq_ctx {
   char *cli_body; int cli_body_len;
   int64_t cli_stream;
   int cli_done;
+  int cli_wt, cli_wt_ready, cli_wt_submitted;   /* WebTransport client */
   /* incoming datagrams (from any connection) */
   struct { int conn_idx; char *data; int len; int used; } idg[128];
 } aq_ctx;
@@ -113,6 +116,27 @@ static uint64_t timestamp(void) {
   struct timespec tp;
   clock_gettime(CLOCK_MONOTONIC, &tp);
   return (uint64_t)tp.tv_sec * NGTCP2_SECONDS + (uint64_t)tp.tv_nsec;
+}
+
+/* QUIC variable-length integers (RFC 9000 §16) — used for the H3-datagram
+ * flow-id (a WebTransport datagram is varint(session_stream_id/4) + payload). */
+static size_t varint_decode(const uint8_t *p, size_t len, uint64_t *val) {
+  if (len < 1) return 0;
+  size_t n = (size_t)1 << (p[0] >> 6);
+  if (len < n) return 0;
+  uint64_t v = p[0] & 0x3f;
+  for (size_t i = 1; i < n; i++) v = (v << 8) | p[i];
+  *val = v; return n;
+}
+static size_t varint_encode(uint8_t *p, uint64_t v) {
+  if (v < 64) { p[0] = (uint8_t)v; return 1; }
+  if (v < 16384) { p[0] = 0x40 | (uint8_t)(v >> 8); p[1] = (uint8_t)v; return 2; }
+  if (v < 1073741824ULL) {
+    p[0] = 0x80 | (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; return 4;
+  }
+  for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
+  p[0] |= 0xc0; return 8;
 }
 
 static void rand_bytes(uint8_t *dest, size_t len) {
@@ -192,11 +216,15 @@ static int h3_recv_header(nghttp3_conn *h3, int64_t stream_id,
     } else if (nv.len == 5 && memcmp(nv.base, ":path", 5) == 0) {
       int n = vv.len < 511 ? (int)vv.len : 511;
       memcpy(s->path, vv.base, n); s->path_len = n;
+    } else if (nv.len == 9 && memcmp(nv.base, ":protocol", 9) == 0) {
+      int n = vv.len < 23 ? (int)vv.len : 23;
+      memcpy(s->protocol, vv.base, n); s->protocol_len = n;
     }
   } else {
     if (nv.len == 7 && memcmp(nv.base, ":status", 7) == 0) {
       char tmp[8] = {0}; int n = vv.len < 7 ? (int)vv.len : 7;
       memcpy(tmp, vv.base, n); s->status = atoi(tmp);
+      if (cn->ctx->cli_wt && s->status == 200) cn->ctx->cli_wt_ready = 1;
     }
   }
   return 0;
@@ -297,6 +325,7 @@ static int ng_remove_cid(ngtcp2_conn *conn, const ngtcp2_cid *cid,
   return 0;
 }
 
+static int conn_write(aq_ctx *c, Conn *cn); /* fwd */
 static int h3_setup_server(Conn *cn); /* fwd */
 static int h3_setup_client(Conn *cn); /* fwd */
 
@@ -369,13 +398,20 @@ static int ng_recv_datagram(ngtcp2_conn *conn, uint32_t flags,
   (void)conn; (void)flags;
   Conn *cn = user_data;
   aq_ctx *c = cn->ctx;
+  const uint8_t *p = data; size_t plen = datalen;
+#if AQ_WEBTRANSPORT
+  if (cn->wt_active || (!c->is_server && c->cli_wt_ready)) {
+    uint64_t flow; size_t consumed = varint_decode(data, datalen, &flow);
+    if (consumed > 0) { p = data + consumed; plen = datalen - consumed; }
+  }
+#endif
   for (int i = 0; i < 128; i++) {
     if (!c->idg[i].used) {
       c->idg[i].used = 1;
       c->idg[i].conn_idx = conn_index(c, cn);
-      c->idg[i].data = malloc(datalen > 0 ? datalen : 1);
-      memcpy(c->idg[i].data, data, datalen);
-      c->idg[i].len = (int)datalen;
+      c->idg[i].data = malloc(plen > 0 ? plen : 1);
+      memcpy(c->idg[i].data, p, plen);
+      c->idg[i].len = (int)plen;
       break;
     }
   }
@@ -426,21 +462,77 @@ static void default_tp(ngtcp2_transport_params *p) {
 /* ====================================================================== */
 /* HTTP/3 setup on handshake                                                */
 /* ====================================================================== */
+#if AQ_WEBTRANSPORT
+/* keeps a WebTransport session stream open: EOF (no body) but not end-stream. */
+static nghttp3_ssize wt_read_data(nghttp3_conn *h3, int64_t stream_id,
+                                  nghttp3_vec *vec, size_t veccnt,
+                                  uint32_t *pflags, void *user_data,
+                                  void *stream_user_data) {
+  (void)h3; (void)stream_id; (void)vec; (void)veccnt;
+  (void)user_data; (void)stream_user_data;
+  *pflags = NGHTTP3_DATA_FLAG_EOF | NGHTTP3_DATA_FLAG_NO_END_STREAM;
+  return 0;
+}
+
+/* server: an extended-CONNECT with :protocol=webtransport establishes a WT
+ * session — reply 200 and keep the CONNECT stream open as the session. */
+static int h3_end_headers(nghttp3_conn *h3, int64_t stream_id, int fin,
+                          void *user_data, void *stream_user_data) {
+  (void)h3; (void)fin; (void)stream_user_data;
+  Conn *cn = user_data;
+  if (!cn->ctx->is_server) return 0;
+  Stream *s = stream_get(cn, stream_id, 0);
+  if (s && s->method_len == 7 && memcmp(s->method, "CONNECT", 7) == 0 &&
+      s->protocol_len >= 12 && memcmp(s->protocol, "webtransport", 12) == 0) {
+    cn->wt_active = 1; cn->wt_session = stream_id;
+    nghttp3_nv nva[1] = {
+      {(uint8_t *)":status", (uint8_t *)"200", 7, 3, NGHTTP3_NV_FLAG_NONE}};
+    nghttp3_data_reader dr; dr.read_data = wt_read_data;
+    nghttp3_conn_submit_response(cn->h3, stream_id, nva, 1, &dr);
+    conn_write(cn->ctx, cn);
+  }
+  return 0;
+}
+
+/* client: submit the WT extended-CONNECT once the server's SETTINGS confirm
+ * enable_connect_protocol (the correct H3 WebTransport sequence). */
+static int h3_recv_settings(nghttp3_conn *h3, const nghttp3_settings *settings,
+                            void *user_data) {
+  (void)h3; (void)settings;
+  Conn *cn = user_data;
+  aq_ctx *c = cn->ctx;
+  if (c->is_server || !c->cli_wt || c->cli_wt_submitted) return 0;
+  c->cli_wt_submitted = 1;
+  int64_t sid;
+  if (ngtcp2_conn_open_bidi_stream(cn->conn, &sid, NULL) != 0) return 0;
+  c->cli_stream = sid;
+  const char *auth = c->cli_authority;
+  const char *path = c->cli_path;
+  nghttp3_nv nva[5] = {
+    {(uint8_t *)":method", (uint8_t *)"CONNECT", 7, 7, NGHTTP3_NV_FLAG_NONE},
+    {(uint8_t *)":protocol", (uint8_t *)"webtransport", 9, 12, NGHTTP3_NV_FLAG_NONE},
+    {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP3_NV_FLAG_NONE},
+    {(uint8_t *)":authority", (uint8_t *)auth, 10, strlen(auth), NGHTTP3_NV_FLAG_NONE},
+    {(uint8_t *)":path", (uint8_t *)path, 5, strlen(path), NGHTTP3_NV_FLAG_NONE},
+  };
+  nghttp3_data_reader dr; dr.read_data = wt_read_data;
+  nghttp3_conn_submit_request(cn->h3, sid, nva, 5, &dr, cn);
+  conn_write(c, cn);
+  return 0;
+}
+#endif
+
 static const nghttp3_callbacks h3_srv_cbs = {
-  NULL, /* acked_stream_data */
-  h3_stream_close,
-  h3_recv_data,
-  NULL, /* deferred_consume */
-  NULL, /* begin_headers */
-  h3_recv_header,
-  NULL, /* end_headers */
-  NULL, /* begin_trailers */
-  NULL, /* recv_trailer */
-  NULL, /* end_trailers */
-  h3_stop_sending,
-  h3_end_stream,
-  h3_reset_stream,
-  NULL, /* shutdown */
+  .stream_close = h3_stream_close,
+  .recv_data = h3_recv_data,
+  .recv_header = h3_recv_header,
+  .stop_sending = h3_stop_sending,
+  .end_stream = h3_end_stream,
+  .reset_stream = h3_reset_stream,
+#if AQ_WEBTRANSPORT
+  .end_headers = h3_end_headers,
+  .recv_settings = h3_recv_settings,
+#endif
 };
 
 static int open_uni(Conn *cn, int64_t *sid) {
@@ -459,14 +551,22 @@ static int h3_bind_streams(Conn *cn) {
 
 static int h3_setup_server(Conn *cn) {
   nghttp3_settings s; nghttp3_settings_default(&s);
+#if AQ_WEBTRANSPORT
+  s.enable_connect_protocol = 1;
+  s.h3_datagram = 1;
+#endif
   if (nghttp3_conn_server_new(&cn->h3, &h3_srv_cbs, &s, NULL, cn) != 0) return -1;
   return h3_bind_streams(cn);
 }
 
 static int h3_setup_client(Conn *cn) {
   nghttp3_settings s; nghttp3_settings_default(&s);
+#if AQ_WEBTRANSPORT
+  s.h3_datagram = 1;
+#endif
   if (nghttp3_conn_client_new(&cn->h3, &h3_srv_cbs, &s, NULL, cn) != 0) return -1;
   if (h3_bind_streams(cn) != 0) return -1;
+  if (cn->ctx->cli_wt) return 0;   /* WT CONNECT is submitted from recv_settings */
   /* submit the GET request on a fresh client bidi stream */
   int64_t sid;
   if (ngtcp2_conn_open_bidi_stream(cn->conn, &sid, NULL) != 0) return -1;
@@ -900,6 +1000,39 @@ int aq_client_send_datagram(aq_ctx *c, const char *data, int len) {
   for (int i = 0; i < MAX_CONNS; i++)
     if (c->conns[i].used) return enqueue_dgram(&c->conns[i], data, len);
   return -1;
+}
+
+int aq_client_wt_connect(aq_ctx *c) { c->cli_wt = 1; return 0; }
+int aq_client_wt_ready(aq_ctx *c) { return c->cli_wt_ready; }
+
+int aq_wt_send_datagram(aq_ctx *c, uint64_t conn_token, const char *data, int len) {
+#if AQ_WEBTRANSPORT
+  if (conn_token >= MAX_CONNS || !c->conns[conn_token].used) return -1;
+  Conn *cn = &c->conns[conn_token];
+  if (!cn->wt_active) return -1;
+  uint8_t hdr[8]; size_t hn = varint_encode(hdr, (uint64_t)(cn->wt_session / 4));
+  char *buf = malloc(hn + (size_t)len);
+  memcpy(buf, hdr, hn); memcpy(buf + hn, data, len);
+  int rv = enqueue_dgram(cn, buf, (int)hn + len);
+  free(buf); return rv;
+#else
+  (void)c; (void)conn_token; (void)data; (void)len; return -1;
+#endif
+}
+
+int aq_client_wt_send_datagram(aq_ctx *c, const char *data, int len) {
+#if AQ_WEBTRANSPORT
+  for (int i = 0; i < MAX_CONNS; i++) {
+    if (!c->conns[i].used) continue;
+    Conn *cn = &c->conns[i];
+    uint8_t hdr[8]; size_t hn = varint_encode(hdr, (uint64_t)(c->cli_stream / 4));
+    char *buf = malloc(hn + (size_t)len);
+    memcpy(buf, hdr, hn); memcpy(buf + hn, data, len);
+    int rv = enqueue_dgram(cn, buf, (int)hn + len);
+    free(buf); return rv;
+  }
+#endif
+  (void)c; (void)data; (void)len; return -1;
 }
 
 int aq_client_done(aq_ctx *c) {

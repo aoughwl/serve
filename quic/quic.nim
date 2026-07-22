@@ -39,6 +39,12 @@ proc aqSendDatagram(c: QuicCtx; connToken: uint64; data: ptr char; len: cint): c
   {.importc: "aq_send_datagram", dynlib: lib.}
 proc aqClientSendDatagram(c: QuicCtx; data: ptr char; len: cint): cint
   {.importc: "aq_client_send_datagram", dynlib: lib.}
+proc aqClientWtConnect(c: QuicCtx): cint {.importc: "aq_client_wt_connect", dynlib: lib.}
+proc aqClientWtReady(c: QuicCtx): cint {.importc: "aq_client_wt_ready", dynlib: lib.}
+proc aqClientWtSendDatagram(c: QuicCtx; data: ptr char; len: cint): cint
+  {.importc: "aq_client_wt_send_datagram", dynlib: lib.}
+proc aqWtSendDatagram(c: QuicCtx; connToken: uint64; data: ptr char; len: cint): cint
+  {.importc: "aq_wt_send_datagram", dynlib: lib.}
 proc aqClientDone(c: QuicCtx): cint {.importc: "aq_client_done", dynlib: lib.}
 proc aqClientStatus(c: QuicCtx): cint {.importc: "aq_client_status", dynlib: lib.}
 proc aqClientBody(c: QuicCtx; buf: ptr char; cap: cint): cint
@@ -171,3 +177,36 @@ proc clientSendDatagram*(c: QuicCtx; data: string) =
     buf[i] = data[i]
     inc i
   discard aqClientSendDatagram(c, addr buf[0], cint(buf.len))
+
+# ---- WebTransport (extended CONNECT + WT datagrams over H3 datagrams) -------
+proc clientWtConnect*(c: QuicCtx) =
+  ## Mark a client context to open a WebTransport session (extended CONNECT
+  ## `:protocol=webtransport`) instead of a plain request. Call before
+  ## `clientStart`. Requires a WebTransport-enabled build of the shim
+  ## (vendored nghttp3 >= 1.x).
+  discard aqClientWtConnect(c)
+
+proc clientWtReady*(c: QuicCtx): bool =
+  ## True once the server has accepted the WebTransport session (CONNECT 200).
+  aqClientWtReady(c) == 1.cint
+
+proc clientWtSendDatagram*(c: QuicCtx; data: string) =
+  ## Send a WebTransport datagram on the client's session.
+  if data.len == 0: return
+  var buf = newSeq[char](data.len)
+  var i = 0
+  while i < data.len:
+    buf[i] = data[i]
+    inc i
+  discard aqClientWtSendDatagram(c, addr buf[0], cint(buf.len))
+
+proc wtSendDatagram*(c: QuicCtx; connToken: uint64; data: string) =
+  ## Send a WebTransport datagram on a server session (identified by the
+  ## `connToken` from a received `Datagram`).
+  if data.len == 0: return
+  var buf = newSeq[char](data.len)
+  var i = 0
+  while i < data.len:
+    buf[i] = data[i]
+    inc i
+  discard aqWtSendDatagram(c, connToken, addr buf[0], cint(buf.len))

@@ -10,3 +10,6 @@ quic/*.pem
 quic/*.o
 quic/test_dgram
 quic/test_dgram_asan
+quic/vendor/
+quic/test_wt
+quic/test_wt_asan
