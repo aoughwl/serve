@@ -29,6 +29,10 @@ proc aqTakeRequest(c: QuicCtx; reqId: ptr uint64; meth: ptr char; mcap: cint;
   {.importc: "aq_take_request", dynlib: lib.}
 proc aqRespond(c: QuicCtx; reqId: uint64; status: cint; ctype, body: cstring;
                bodyLen: cint): cint {.importc: "aq_respond", dynlib: lib.}
+proc aqClientPost(c: QuicCtx; body: cstring; len: cint): cint
+  {.importc: "aq_client_post", dynlib: lib.}
+proc aqRequestBody(c: QuicCtx; reqId: uint64; buf: ptr char; cap: cint): cint
+  {.importc: "aq_request_body", dynlib: lib.}
 proc aqClientDone(c: QuicCtx): cint {.importc: "aq_client_done", dynlib: lib.}
 proc aqClientStatus(c: QuicCtx): cint {.importc: "aq_client_status", dynlib: lib.}
 proc aqClientBody(c: QuicCtx; buf: ptr char; cap: cint): cint
@@ -41,6 +45,7 @@ type H3Request* = object
   id*: uint64
   meth*: string
   path*: string
+  body*: string
 
 proc quicServer*(host: string; port: int; certPath, keyPath: string): QuicCtx =
   ## A bound HTTP/3 (QUIC) server context on `host:port` with a PEM cert/key.
@@ -56,6 +61,11 @@ proc quicClient*(host: string; port: int; authority, path: string): QuicCtx =
   var a = authority
   var p = path
   aqClientNew(toCString(h), uint16(port), toCString(a), toCString(p))
+
+proc clientPost*(c: QuicCtx; body: string) =
+  ## Switch a client context to POST with `body` (call before `clientStart`).
+  var b = body
+  discard aqClientPost(c, toCString(b), cint(b.len))
 
 proc clientStart*(c: QuicCtx): int = int(aqClientStart(c))
 proc fd*(c: QuicCtx): int = int(aqFd(c))
@@ -86,6 +96,15 @@ proc takeRequest*(c: QuicCtx): H3Request =
     i = 0
     while i < 512 and pbuf[i] != '\0':
       result.path.add pbuf[i]
+      inc i
+    # request body (POST payloads); empty for GET
+    const bcap = 1 shl 20
+    var bbuf = newSeq[char](bcap)
+    let bn = aqRequestBody(c, id, addr bbuf[0], bcap.cint)
+    result.body = ""
+    i = 0
+    while i < bn:
+      result.body.add bbuf[i]
       inc i
 
 proc respond*(c: QuicCtx; id: uint64; status: int; ctype, body: string) =

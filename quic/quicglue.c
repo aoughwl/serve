@@ -99,6 +99,8 @@ typedef struct aq_ctx {
   /* client single-request state */
   char cli_authority[256];
   char cli_path[512];
+  char cli_method[8];
+  char *cli_body; int cli_body_len;
   int64_t cli_stream;
   int cli_done;
 } aq_ctx;
@@ -441,15 +443,28 @@ static int h3_setup_client(Conn *cn) {
   int64_t sid;
   if (ngtcp2_conn_open_bidi_stream(cn->conn, &sid, NULL) != 0) return -1;
   cn->ctx->cli_stream = sid;
-  const char *auth = cn->ctx->cli_authority;
-  const char *path = cn->ctx->cli_path;
+  aq_ctx *ctx = cn->ctx;
+  const char *auth = ctx->cli_authority;
+  const char *path = ctx->cli_path;
+  const char *meth = ctx->cli_method;
   nghttp3_nv nva[4] = {
-    {(uint8_t *)":method", (uint8_t *)"GET", 7, 3, NGHTTP3_NV_FLAG_NONE},
+    {(uint8_t *)":method", (uint8_t *)meth, 7, strlen(meth), NGHTTP3_NV_FLAG_NONE},
     {(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, NGHTTP3_NV_FLAG_NONE},
     {(uint8_t *)":authority", (uint8_t *)auth, 10, strlen(auth), NGHTTP3_NV_FLAG_NONE},
     {(uint8_t *)":path", (uint8_t *)path, 5, strlen(path), NGHTTP3_NV_FLAG_NONE},
   };
-  if (nghttp3_conn_submit_request(cn->h3, sid, nva, 4, NULL, cn) != 0) return -1;
+  nghttp3_data_reader dr; dr.read_data = resp_read_data;
+  const nghttp3_data_reader *drp = NULL;
+  if (ctx->cli_body && ctx->cli_body_len > 0) {
+    Stream *rs = stream_get(cn, sid, 1);
+    if (rs) {
+      rs->sbody = malloc(ctx->cli_body_len);
+      memcpy(rs->sbody, ctx->cli_body, ctx->cli_body_len);
+      rs->sbody_len = ctx->cli_body_len; rs->sbody_off = 0;
+      drp = &dr;
+    }
+  }
+  if (nghttp3_conn_submit_request(cn->h3, sid, nva, 4, drp, cn) != 0) return -1;
   return 0;
 }
 
@@ -636,6 +651,7 @@ aq_ctx *aq_client_new(const char *host, uint16_t port,
   snprintf(c->cli_authority, sizeof(c->cli_authority), "%s", authority);
   snprintf(c->cli_path, sizeof(c->cli_path), "%s", path);
   c->cli_stream = -1;
+  snprintf(c->cli_method, sizeof(c->cli_method), "GET");
   return c;
 }
 
@@ -786,6 +802,24 @@ int aq_respond(aq_ctx *c, uint64_t req_id, int status, const char *ctype,
   return 0;
 }
 
+int aq_client_post(aq_ctx *c, const char *body, int len) {
+  snprintf(c->cli_method, sizeof(c->cli_method), "POST");
+  c->cli_body = malloc(len > 0 ? len : 1);
+  if (len > 0) memcpy(c->cli_body, body, len);
+  c->cli_body_len = len;
+  return 0;
+}
+
+int aq_request_body(aq_ctx *c, uint64_t req_id, char *buf, int cap) {
+  if (req_id >= MAX_REQ || !c->reqs[req_id].used) return 0;
+  Conn *cn = c->reqs[req_id].conn;
+  Stream *s = stream_get(cn, c->reqs[req_id].stream_id, 0);
+  if (!s || !s->rbody) return 0;
+  int n = s->rbody_len < cap ? s->rbody_len : cap;
+  memcpy(buf, s->rbody, n);
+  return n;
+}
+
 int aq_client_done(aq_ctx *c) {
   /* done when the response stream ended, or all conns gone */
   if (c->cli_done) return 1;
@@ -817,6 +851,7 @@ int aq_client_body(aq_ctx *c, char *buf, int cap) {
 void aq_free(aq_ctx *c) {
   if (!c) return;
   for (int i = 0; i < MAX_CONNS; i++) if (c->conns[i].used) conn_close(c, &c->conns[i]);
+  if (c->cli_body) free(c->cli_body);
   if (c->cred) gnutls_certificate_free_credentials(c->cred);
   if (c->fd >= 0) close(c->fd);
   free(c);

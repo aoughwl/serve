@@ -6,9 +6,11 @@
 import std/[cmdline, strutils]
 import serve/reactorh3
 
-proc handle(meth, path: string): H3Response {.nimcall.} =
-  response(200, "text/plain",
-           "hello from aoughwl HTTP/3: " & meth & " " & path & "\n")
+proc handle(meth, path, body: string): H3Response {.nimcall.} =
+  var msg = "hello from aoughwl HTTP/3: " & meth & " " & path & "\n"
+  if body.len > 0:
+    msg.add "echo: " & body & "\n"
+  response(200, "text/plain", msg)
 
 var port = 8443
 var cert = "cert.pem"

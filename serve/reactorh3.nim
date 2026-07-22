@@ -19,7 +19,7 @@ type
     status*: int
     ctype*: string
     body*: string
-  H3Handler* = proc(meth, path: string): H3Response {.nimcall.}
+  H3Handler* = proc(meth, path, body: string): H3Response {.nimcall.}
 
 proc response*(status: int; ctype, body: string): H3Response =
   H3Response(status: status, ctype: ctype, body: body)
@@ -50,19 +50,22 @@ proc serveH3Reactor*(port: int; certPath, keyPath: string; handler: H3Handler;
     discard handleTimeout(srv)
     var req = takeRequest(srv)
     while req.ok:
-      let r = handler(req.meth, req.path)
+      let r = handler(req.meth, req.path, req.body)
       respond(srv, req.id, r.status, r.ctype, r.body)
       req = takeRequest(srv)
     discard flush(srv)
 
-proc h3Get*(host: string; port: int; authority, path: string;
-            maxIters = 200000): tuple[status: int, body: string] =
-  ## Drive a single HTTP/3 GET to completion on its own epoll loop and return the
-  ## status + body. A self-contained client for tests and simple fetches.
+proc h3Fetch*(host: string; port: int; authority, path: string;
+              postBody = ""; maxIters = 200000): tuple[status: int, body: string] =
+  ## Drive a single HTTP/3 request to completion on its own epoll loop and return
+  ## the status + body. GET when `postBody` is empty, POST otherwise. A
+  ## self-contained client for tests and simple fetches.
   result = (0, "")
   let cli = quicClient(host, port, authority, path)
   if cli == nil:
     return
+  if postBody.len > 0:
+    clientPost(cli, postBody)
   discard clientStart(cli)
   let cfd = fd(cli)
   let epfd = ep.epollCreate()
@@ -87,3 +90,13 @@ proc h3Get*(host: string; port: int; authority, path: string;
       done = true
     inc iter
   freeCtx(cli)
+
+proc h3Get*(host: string; port: int; authority, path: string;
+            maxIters = 200000): tuple[status: int, body: string] =
+  ## Convenience: an HTTP/3 GET.
+  h3Fetch(host, port, authority, path, "", maxIters)
+
+proc h3Post*(host: string; port: int; authority, path, body: string;
+             maxIters = 200000): tuple[status: int, body: string] =
+  ## Convenience: an HTTP/3 POST with `body`.
+  h3Fetch(host, port, authority, path, body, maxIters)
