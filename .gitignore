@@ -1,2 +1,10 @@
 nimcache/
 *.exe
+
+# QUIC glue build artifacts + test material
+quic/libaowlquic.so
+quic/libaowlquic_asan.so
+quic/test_quic
+quic/test_quic_asan
+quic/*.pem
+quic/*.o
