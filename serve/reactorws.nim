@@ -180,9 +180,9 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
           inc k
     else:
       inbuf = subStr(inbuf, consumed, inbuf.len)
-      if op == 0x8:            # close
+      if op == 0x8:            # close: echo the peer's close code (RFC 6455 §5.5.1)
         var ok = false
-        r.awaitSendFrame(fd, opClose, "", ok)
+        r.awaitSendFrame(fd, opClose, payload, ok)
         alive = false
       elif op == 0x9:          # ping -> pong
         var ok = false
