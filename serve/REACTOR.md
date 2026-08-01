@@ -78,6 +78,19 @@ per connection, all multiplexed on one OS thread:
   response, loops for keep-alive. Reuses the `http` package's parse/serialize.
   *Verified: 60 simultaneous keep-alive conns × 5 requests (300/300) on one
   thread* (`tests/reactor_http_e2e.sh`).
+- **`serve/reactorh2.nim`** — async **HTTP/2 (h2c)**. `serveHttp2Reactor(port,
+  handler)`, same `proc(req: Request): Response` handler shape as HTTP/1.1. The
+  protocol work stays in libnghttp2, which is a pure codec — it never touches a
+  socket — so the coroutine only drains what the session has queued
+  (`h2NextOut`) and feeds it what it reads (`h2Feed`). Sessions live in a fixed
+  global table (`MaxH2Conns`, overflow counted by `h2RejectedConns()`) because
+  the `user_data` pointer handed to nghttp2 must stay address-stable, which a
+  coroutine local is not. Connection teardown is a FIN plus a bounded drain, not
+  a bare `close()`, so the peer's last frames do not turn into an RST.
+  *Verified: **h2spec 146/146** (`tests/h2spec.sh`) — was 95/146 against the
+  blocking server, which serves one connection at a time and so wedged on any
+  connection left open — plus 20 concurrent requests with an idle connection
+  parked (`tests/reactor_h2_e2e.sh`).*
 - **`serve/reactorws.nim`** — async **WebSocket (RFC 6455)**.
   `serveWsReactor(port, handler)` where `handler` is `proc(msg: string;
   isBinary: bool): string`. Reads the Upgrade request, completes the handshake
@@ -116,7 +129,7 @@ per connection, all multiplexed on one OS thread:
     nghttp3 instead. *Verified: bidi echo + a uni stream in each direction on one
     thread* (`tests/reactor_wtstream_e2e.sh`), ASan-clean.
 
-Both TCP servers use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
+All three TCP servers use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
 than a captured closure, which composes cleanly across the coroutine boundary,
 and flag-based control flow throughout (no `break`/`return` beside a `suspend`).
 

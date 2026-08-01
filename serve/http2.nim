@@ -55,6 +55,7 @@ proc nghttp2_session_callbacks_del(cbs: nil pointer) {.cdecl, importc, dynlib: n
 proc nghttp2_session_callbacks_set_on_frame_recv_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_callbacks_set_on_header_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_callbacks_set_on_begin_headers_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
+proc nghttp2_session_callbacks_set_on_begin_frame_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_callbacks_set_on_stream_close_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs: nil pointer; cb: pointer) {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_server_new(session: ptr pointer; cbs: pointer; userData: pointer): cint {.cdecl, importc, dynlib: nghttp2Lib.}
@@ -64,6 +65,7 @@ proc nghttp2_session_mem_send(session: nil pointer; dataPtr: ptr pointer): int {
 proc nghttp2_submit_settings(session: nil pointer; flags: uint8; iv: pointer; niv: csize_t): cint {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_submit_response(session: nil pointer; streamId: int32; nva: pointer; nvlen: csize_t; dataPrd: pointer): cint {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_want_read(session: nil pointer): cint {.cdecl, importc, dynlib: nghttp2Lib.}
+proc nghttp2_session_terminate_session(session: nil pointer; errorCode: uint32): cint {.cdecl, importc, dynlib: nghttp2Lib.}
 proc nghttp2_session_want_write(session: nil pointer): cint {.cdecl, importc, dynlib: nghttp2Lib.}
 
 # --- constants ---------------------------------------------------------------
@@ -74,6 +76,7 @@ const
   FRAME_TYPE_HEADERS = 1'u8
   NGHTTP2_DATA_FLAG_EOF = 0x01'u32
   NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS = 3'i32
+  NGHTTP2_PROTOCOL_ERROR = 1'u32
 
 # --- per-connection session state --------------------------------------------
 
@@ -95,6 +98,7 @@ type
     session: nil pointer
     handler: H2Handler
     streams: array[64, H2Stream]
+    lastRecvStreamId: int32   ## highest client stream id accepted so far
 
 proc findStream(s: var H2Session; id: int32): int =
   var i = 0
@@ -136,6 +140,31 @@ proc ptrToStr(p: pointer; n: int): string =
     inc i
 
 # --- callbacks (cdecl, dispatched via user_data → H2Session) ------------------
+
+proc onBeginFrame(session: nil pointer; hd: pointer; userData: pointer): cint {.cdecl.} =
+  ## Fires for EVERY frame header, before nghttp2 decides what to do with it —
+  ## which is the only place this check can live: a HEADERS naming an already
+  ## used stream id never reaches `on_begin_headers`, nghttp2 discards it in
+  ## silence and answers nothing.
+  ##
+  ## RFC 7540 §5.1.1: a HEADERS opening a stream whose identifier is not greater
+  ## than every identifier received so far is a CONNECTION error of type
+  ## PROTOCOL_ERROR. Terminating the session here queues the GOAWAY the peer is
+  ## owed. Even-numbered ids are nghttp2's own business (it does flag those);
+  ## a HEADERS on a stream we still hold open is trailers, not a new stream,
+  ## hence the findStream guard.
+  ##
+  ## `nghttp2_frame_hd` has the same prefix layout as `nghttp2_frame`, so the
+  ## frame-header accessors apply unchanged.
+  if frameType(hd) == FRAME_TYPE_HEADERS:
+    let s = cast[ptr H2Session](userData)
+    let sid = frameStreamId(hd)
+    if sid > 0'i32 and (sid and 1'i32) == 1'i32:
+      if sid <= s[].lastRecvStreamId and findStream(s[], sid) < 0:
+        discard nghttp2_session_terminate_session(session, NGHTTP2_PROTOCOL_ERROR)
+      elif sid > s[].lastRecvStreamId:
+        s[].lastRecvStreamId = sid
+  0
 
 proc onBeginHeaders(session: nil pointer; frame: pointer; userData: pointer): cint {.cdecl.} =
   if frameType(frame) == FRAME_TYPE_HEADERS:
@@ -292,6 +321,131 @@ proc onStreamClose(session: nil pointer; streamId: int32; errorCode: uint32;
     s[].streams[idx].used = false
   0
 
+# --- transport-agnostic session seam -----------------------------------------
+#
+# nghttp2 is a pure codec — it never touches a socket — so the session can be
+# driven by anything that can hand it bytes and take bytes back. The blocking
+# driver below is one such caller; `serve/reactorh2.nim` is the other, and it
+# suspends between the two halves instead of blocking.
+#
+# Sessions live in a fixed global table rather than on a coroutine's stack: the
+# pointer handed to nghttp2 as `user_data` must stay valid for the life of the
+# connection, and a global slot is address-stable where a coroutine local is
+# not. The table size is therefore also the concurrent-connection bound, and an
+# overflow is COUNTED (`h2RejectedConns`), never silently dropped.
+
+const MaxH2Conns* = 128
+
+var gH2Sessions: array[MaxH2Conns, H2Session]
+var gH2Used: array[MaxH2Conns, bool]
+var gH2Rejected = 0
+
+proc h2RejectedConns*(): int =
+  ## Connections refused because the session table was full.
+  gH2Rejected
+
+proc h2OpenSession*(handler: H2Handler): int =
+  ## Take a free session slot, install the callbacks, and queue the server
+  ## connection preface (SETTINGS). Returns the slot, or -1 when the table is
+  ## full or nghttp2 refuses to build the session.
+  var slot = -1
+  var i = 0
+  while i < MaxH2Conns:
+    if not gH2Used[i]:
+      slot = i
+      break
+    inc i
+  if slot < 0:
+    inc gH2Rejected
+    return -1
+
+  var cbsPtr = cast[pointer](0)
+  if nghttp2_session_callbacks_new(addr cbsPtr) != 0:
+    return -1
+  nghttp2_session_callbacks_set_on_begin_headers_callback(cbsPtr, onBeginHeaders)
+  nghttp2_session_callbacks_set_on_begin_frame_callback(cbsPtr, onBeginFrame)
+  nghttp2_session_callbacks_set_on_header_callback(cbsPtr, onHeader)
+  nghttp2_session_callbacks_set_on_frame_recv_callback(cbsPtr, onFrameRecv)
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbsPtr, onDataChunk)
+  nghttp2_session_callbacks_set_on_stream_close_callback(cbsPtr, onStreamClose)
+
+  gH2Sessions[slot] = H2Session(session: nil, handler: handler,
+                                streams: default(array[64, H2Stream]),
+                                lastRecvStreamId: 0'i32)
+  var sessionPtr = cast[pointer](0)
+  if nghttp2_session_server_new(addr sessionPtr, cbsPtr, addr gH2Sessions[slot]) != 0:
+    nghttp2_session_callbacks_del(cbsPtr)
+    return -1
+  gH2Sessions[slot].session = sessionPtr
+  nghttp2_session_callbacks_del(cbsPtr)
+  gH2Used[slot] = true
+
+  var iv = default(array[1, Nghttp2SettingsEntry])
+  iv[0] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+                               value: 100'u32)
+  discard nghttp2_submit_settings(gH2Sessions[slot].session, 0'u8, addr iv[0], csize_t(1))
+  return slot
+
+proc h2CloseSession*(slot: int) =
+  ## Free the nghttp2 session and release the slot.
+  if slot >= 0 and slot < MaxH2Conns and gH2Used[slot]:
+    nghttp2_session_del(gH2Sessions[slot].session)
+    gH2Sessions[slot].session = nil
+    gH2Sessions[slot].streams = default(array[64, H2Stream])
+    gH2Sessions[slot].lastRecvStreamId = 0'i32
+    gH2Used[slot] = false
+
+proc h2Feed*(slot: int; data: pointer; n: int): bool =
+  ## Hand `n` received bytes to the session. False means a fatal codec error —
+  ## a *protocol* violation is not fatal here: nghttp2 queues the GOAWAY or
+  ## RST_STREAM and the caller must still drain the output before closing.
+  ##
+  ## `nghttp2_session_mem_recv` may consume LESS than it was given, so this
+  ## loops until the buffer is drained. Feeding it once and discarding the
+  ## remainder silently drops whole frames: that is what made h2spec's
+  ## "stream identifier numerically smaller than previous" hang — the offending
+  ## HEADERS sat in the tail of the same read that carried the valid one, was
+  ## never parsed, and so never produced the GOAWAY it should have.
+  if slot < 0 or slot >= MaxH2Conns or not gH2Used[slot]:
+    return false
+  var off = 0
+  while off < n:
+    let p = cast[pointer](cast[uint](data) + uint(off))
+    let consumed = nghttp2_session_mem_recv(gH2Sessions[slot].session, p, csize_t(n - off))
+    if consumed < 0:
+      return false
+    if consumed == 0:
+      break            # session is paused (no callback of ours pauses it today)
+    off = off + consumed
+  return true
+
+proc h2NextOut*(slot: int; outPtr: var pointer; outLen: var int): bool =
+  ## Take the next queued output chunk. False = fatal session error. True with
+  ## `outLen == 0` = nothing queued right now. The returned buffer belongs to
+  ## nghttp2 and stays valid until the next call on this session, so a caller
+  ## may suspend mid-write.
+  outPtr = cast[pointer](0)
+  outLen = 0
+  if slot < 0 or slot >= MaxH2Conns or not gH2Used[slot]:
+    return false
+  if nghttp2_session_want_write(gH2Sessions[slot].session) == 0:
+    return true
+  var p = cast[pointer](0)
+  let n = nghttp2_session_mem_send(gH2Sessions[slot].session, addr p)
+  if n < 0:
+    return false
+  outPtr = p
+  outLen = int(n)
+  return true
+
+proc h2Idle*(slot: int): bool =
+  ## True once the session neither wants more input nor has output left — i.e.
+  ## the connection is finished (including after a GOAWAY it just sent).
+  if slot < 0 or slot >= MaxH2Conns or not gH2Used[slot]:
+    return true
+  return nghttp2_session_want_read(gH2Sessions[slot].session) == 0 and
+         nghttp2_session_want_write(gH2Sessions[slot].session) == 0
+
 # --- transport (plaintext fd / TLS) + driver ---------------------------------
 
 type
@@ -345,13 +499,15 @@ proc runH2(t: var H2Transport; handler: H2Handler) =
     h2Close(t)
     return
   nghttp2_session_callbacks_set_on_begin_headers_callback(cbsPtr, onBeginHeaders)
+  nghttp2_session_callbacks_set_on_begin_frame_callback(cbsPtr, onBeginFrame)
   nghttp2_session_callbacks_set_on_header_callback(cbsPtr, onHeader)
   nghttp2_session_callbacks_set_on_frame_recv_callback(cbsPtr, onFrameRecv)
   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbsPtr, onDataChunk)
   nghttp2_session_callbacks_set_on_stream_close_callback(cbsPtr, onStreamClose)
 
   var state = H2Session(session: nil, handler: handler,
-                        streams: default(array[64, H2Stream]))
+                        streams: default(array[64, H2Stream]),
+                        lastRecvStreamId: 0'i32)
   var sessionPtr = cast[pointer](0)
   if nghttp2_session_server_new(addr sessionPtr, cbsPtr, addr state) != 0:
     nghttp2_session_callbacks_del(cbsPtr)
@@ -377,8 +533,19 @@ proc runH2(t: var H2Transport; handler: H2Handler) =
     let got = h2Read(t, addr buf[0], buf.len)
     if got <= 0:
       break
-    let consumed = nghttp2_session_mem_recv(state.session, addr buf[0], csize_t(got))
-    if consumed < 0:
+    # mem_recv may consume less than it is given; feed the whole read or whole
+    # frames are silently dropped (see h2Feed).
+    var off = 0
+    var recvErr = false
+    while off < got and not recvErr:
+      let p = cast[pointer](cast[uint](addr buf[0]) + uint(off))
+      let consumed = nghttp2_session_mem_recv(state.session, p, csize_t(got - off))
+      if consumed <= 0:
+        recvErr = consumed < 0
+        off = got
+      else:
+        off = off + consumed
+    if recvErr:
       break
     if not flushSend(state, t):
       break
@@ -400,6 +567,12 @@ proc serveHttp2ConnectionTls*(tlsSock: TlsSocket; handler: H2Handler) =
 proc serveHttp2*(port: int; handler: H2Handler; maxRequests = 0) =
   ## Run an h2c (HTTP/2 cleartext) server on `port`. Test with
   ## `curl --http2-prior-knowledge http://host:port/`.
+  ##
+  ## ONE CONNECTION AT A TIME: this loop drives a whole session to completion
+  ## before accepting again, so a peer that opens a connection and keeps it open
+  ## stops every other peer from being served. For anything facing more than one
+  ## client use `serve/reactorh2.nim`'s `serveHttp2Reactor`, which multiplexes
+  ## connections on the same thread.
   initTcp()
   let l = listenTcp(port)
   if l == InvalidTcpHandle:
