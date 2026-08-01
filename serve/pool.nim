@@ -39,16 +39,24 @@ proc configurePool*(listenFd: TcpHandle; handler: NimcallHandler; useTls: bool;
 
 proc poolWorker(arg: pointer) {.nimcall.} =
   ## One worker: accept a connection off the shared socket and serve it to
-  ## completion, forever. A transient accept failure is skipped, not fatal.
+  ## completion. A transient accept failure is retried; a hard one — which is
+  ## what `stopServing` produces, by shutting the shared listener down under
+  ## every worker at once — ends the worker so `runPool`'s joins can return.
+  ##
+  ## Previously this was `while true` with a bare `continue` on a failed accept:
+  ## a dead listener span every worker at 100% CPU, and nothing could ever end
+  ## the pool.
   discard arg
-  while true:
+  var running = true
+  while running:
     let fd = acceptTcp(gPoolListen)
-    if fd == InvalidTcpHandle:
-      continue
-    if gPoolUseTls:
-      serveConnectionTlsNimcall(fd, gPoolCtx, gPoolHandler)
-    else:
-      serveConnectionNimcall(fd, gPoolHandler)
+    if fd != InvalidTcpHandle:
+      if gPoolUseTls:
+        serveConnectionTlsNimcall(fd, gPoolCtx, gPoolHandler)
+      else:
+        serveConnectionNimcall(fd, gPoolHandler)
+    elif serveStopRequested() or not tcpErrorWouldRetry(lastTcpErrorCode()):
+      running = false
 
 proc spawnWorker*(t: var RawThread) =
   ## Create one worker thread into caller-owned storage `t`. `t` MUST outlive the
@@ -84,20 +92,23 @@ proc serveConcurrent*(port: int; handler: NimcallHandler; workers = 4) =
     echo "failed to listen on :", port
     shutdownTcp()
     return
+  registerServeListener(l)
   configurePool(l, handler, false, TlsContext(handle: nil, mode: tlsServer))
   echo "serving on :", port, " with ", workers, " worker(s)"
   runPool(workers)
   closeTcp(l)
   shutdownTcp()
 
-proc serveTlsConcurrent*(port: int; certFile: string; keyFile: string;
+proc serveTlsConcurrent*(port: int; ctx0: TlsContext;
                          handler: NimcallHandler; workers = 4) =
   ## Concurrent HTTPS server: `workers` threads share one listening socket and a
-  ## single TLS context. Loops forever.
+  ## single TLS context — one YOU built and configured, so versions, ciphers,
+  ## groups, ALPN and extra SNI certificates stay reachable. Returns when
+  ## `stopServing` shuts the listener down.
   initTcp()
-  var ctx = newTlsServerContext(certFile, keyFile)
+  var ctx = ctx0
   if not ctx.isValid:
-    echo "failed to load TLS cert/key: ", lastTlsError()
+    echo "invalid TLS context: ", lastTlsError()
     shutdownTcp()
     return
   let l = listenTcp(port)
@@ -106,9 +117,15 @@ proc serveTlsConcurrent*(port: int; certFile: string; keyFile: string;
     ctx.close()
     shutdownTcp()
     return
+  registerServeListener(l)
   configurePool(l, handler, true, ctx)
   echo "serving TLS on :", port, " with ", workers, " worker(s)"
   runPool(workers)
   ctx.close()
   closeTcp(l)
   shutdownTcp()
+
+proc serveTlsConcurrent*(port: int; certFile: string; keyFile: string;
+                         handler: NimcallHandler; workers = 4) =
+  ## As above, with a default context built from a PEM cert chain and key.
+  serveTlsConcurrent(port, newTlsServerContext(certFile, keyFile), handler, workers)

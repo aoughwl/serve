@@ -36,6 +36,61 @@ const
   WriteChunkBytes = 65536
   MaxKeepAliveRequests* = 100          ## max requests served on one kept-alive connection
 
+# --- runtime knobs and the stop signal ---------------------------------------
+#
+# `ReadTimeoutMillis` stays the DEFAULT rather than the law: a slowloris guard
+# a deployment cannot move is not a guard, it is a guess.
+
+var gReadTimeoutMs = ReadTimeoutMillis
+
+proc setServeReadTimeout*(ms: int) =
+  ## Per-socket read timeout for every subsequently served connection.
+  ## `ms <= 0` disables it (and with it the slowloris guard).
+  gReadTimeoutMs = ms
+
+proc serveReadTimeout*(): int =
+  gReadTimeoutMs
+
+# The blocking servers sit in `accept()`, which no flag can interrupt — the
+# listener has to be shut down under them. So the stop path is: set the flag,
+# then shutdown the listening fd, which makes the pending accept return.
+# `shutdown` is a bare syscall and safe from a signal handler.
+type SigHandler = proc(sig: cint) {.cdecl.}
+proc csignal(sig: cint; handler: SigHandler): nil pointer {.cdecl,
+  importc: "signal", header: "<signal.h>".}
+const
+  SIGINT = 2.cint
+  SIGTERM = 15.cint
+
+var gServeStop = false
+var gListenFds: seq[TcpHandle] = @[]
+
+proc stopServing*() =
+  ## Ask every running blocking server in this process to stop accepting and
+  ## return once the connection in hand is finished.
+  gServeStop = true
+  for fd in gListenFds:
+    discard shutdownTcpBoth(fd)
+
+proc serveStopRequested*(): bool =
+  gServeStop
+
+proc registerServeListener*(fd: TcpHandle) =
+  ## Track a listening socket so `stopServing` can shut it down under whatever
+  ## is blocked in `accept` on it. The worker pool registers its shared listener
+  ## this way.
+  gListenFds.add fd
+
+proc onServeSignal(sig: cint) {.cdecl.} =
+  stopServing()
+
+proc serveStopOnSignals*() =
+  ## Make SIGINT/SIGTERM stop the blocking servers instead of killing them
+  ## mid-response. Opt-in, unlike the reactor entry points, because a blocking
+  ## server is often one part of a larger program that owns its own signals.
+  discard csignal(SIGINT, onServeSignal)
+  discard csignal(SIGTERM, onServeSignal)
+
 type
   Handler* = proc(req: Request): Response {.closure.}
     ## A request handler: takes the parsed `Request`, returns the `Response` to
@@ -276,7 +331,7 @@ proc sendResponse(c: var ServerConn; resp: Response; includeBody: bool): bool =
 proc serveConnCore(c: var ServerConn; handler: Handler) =
   ## The shared request/response loop over any `ServerConn` (plain or TLS):
   ## read → handle → write, looping for HTTP keep-alive, then close.
-  connSetReadTimeout(c, ReadTimeoutMillis)
+  connSetReadTimeout(c, gReadTimeoutMs)
   var count = 0
   var alive = true
   while alive and count < MaxKeepAliveRequests:
@@ -317,7 +372,7 @@ proc serveConnCoreNimcall(c: var ServerConn; handler: NimcallHandler) =
   ## handler. Duplicated rather than closure-wrapped: nimony's lambda lifter
   ## cannot lift a closure that captures a proc-typed variable, so the worker
   ## pool must call the bare function pointer directly.
-  connSetReadTimeout(c, ReadTimeoutMillis)
+  connSetReadTimeout(c, gReadTimeoutMs)
   var count = 0
   var alive = true
   while alive and count < MaxKeepAliveRequests:
@@ -384,25 +439,33 @@ proc serve*(port: int; handler: Handler; maxRequests = 0) =
     shutdownTcp()
     return
   echo "serving on :", port, " (fd=", l, ")"
+  gListenFds.add l
   var served = 0
-  while maxRequests == 0 or served < maxRequests:
+  while (maxRequests == 0 or served < maxRequests) and not gServeStop:
     let clientFd = acceptTcp(l)
     if clientFd != InvalidTcpHandle:
       serveConnection(clientFd, handler)
       inc served
+    elif not tcpErrorWouldRetry(lastTcpErrorCode()):
+      # A hard accept error — the listener was shut down by `stopServing`, or
+      # the fd is gone. Previously this branch did nothing, so the loop spun on
+      # a dead listener at 100% CPU forever.
+      break
   closeTcp(l)
   shutdownTcp()
   echo "served ", served, " connection(s); exiting"
 
-proc serveTls*(port: int; certFile: string; keyFile: string; handler: Handler;
+proc serveTls*(port: int; ctx0: TlsContext; handler: Handler;
                maxRequests = 0) =
-  ## Run a programmable HTTPS server on `port`, loading a PEM certificate chain
-  ## and private key. Each accepted connection gets its own TLS session over the
-  ## shared context, then runs the same handler loop as `serve`.
+  ## Run a programmable HTTPS server on `port` with a context YOU built and
+  ## configured — protocol versions, cipher suites, key-exchange groups
+  ## (post-quantum included), ALPN, extra SNI certificates, session resumption.
+  ## Each accepted connection gets its own TLS session over that shared context,
+  ## then runs the same handler loop as `serve`.
   initTcp()
-  var ctx = newTlsServerContext(certFile, keyFile)
+  var ctx = ctx0
   if not ctx.isValid:
-    echo "failed to load TLS cert/key: ", lastTlsError()
+    echo "invalid TLS context: ", lastTlsError()
     shutdownTcp()
     return
   let l = listenTcp(port)
@@ -412,16 +475,25 @@ proc serveTls*(port: int; certFile: string; keyFile: string; handler: Handler;
     shutdownTcp()
     return
   echo "serving TLS on :", port, " (fd=", l, ")"
+  gListenFds.add l
   var served = 0
-  while maxRequests == 0 or served < maxRequests:
+  while (maxRequests == 0 or served < maxRequests) and not gServeStop:
     let clientFd = acceptTcp(l)
     if clientFd != InvalidTcpHandle:
       serveConnectionTls(clientFd, ctx, handler)
       inc served
+    elif not tcpErrorWouldRetry(lastTcpErrorCode()):
+      break
   ctx.close()
   closeTcp(l)
   shutdownTcp()
   echo "served ", served, " TLS connection(s); exiting"
+
+proc serveTls*(port: int; certFile: string; keyFile: string; handler: Handler;
+               maxRequests = 0) =
+  ## As above, with a default context built from a PEM certificate chain and
+  ## private key.
+  serveTls(port, newTlsServerContext(certFile, keyFile), handler, maxRequests)
 
 proc staticRoute*(root: string; req: Request): Response =
   ## Route one request against a static-file `root`: validate, handle
