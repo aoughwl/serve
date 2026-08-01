@@ -65,7 +65,9 @@ type
     waiting: Table[cint, Continuation]  ## fd -> parked continuation awaiting readiness
     interest: Table[cint, uint32]    ## fd -> currently-armed epoll event mask
     idle: Table[cint, int]           ## fd -> configured idle timeout in ms
-    deadline: Table[cint, int64]     ## fd -> monotonic ms at which that idle expires
+    deadline: Table[cint, int64]     ## fd -> monotonic ms at which that deadline expires
+    resumeAt: Table[cint, bool]      ## fd -> deadline RESUMES the coroutine (vs shuts the fd)
+    expired: Table[cint, bool]       ## fd -> its resume-deadline fired; read once by the waiter
     live: int                        ## number of registered fds (loop runs while > 0)
     wakeFd: cint                     ## eventfd the loop also watches, to be interrupted
     listeners: seq[cint]             ## listening fds, closed first on a graceful stop
@@ -80,7 +82,8 @@ proc newReactor*(): Reactor =
   let ef = eventfd(0.cuint, EFD_CLOEXEC or EFD_NONBLOCK)
   result = Reactor(epfd: ep.epollCreate(), waiting: initTable[cint, Continuation](),
                    interest: initTable[cint, uint32](), idle: initTable[cint, int](),
-                   deadline: initTable[cint, int64](), live: 0, wakeFd: ef,
+                   deadline: initTable[cint, int64](), resumeAt: initTable[cint, bool](),
+                   expired: initTable[cint, bool](), live: 0, wakeFd: ef,
                    listeners: @[], stopRequested: false, stopGraceful: true)
   if ef >= 0.cint:
     # Deliberately NOT via `register`: the wake fd must not count towards `live`,
@@ -118,6 +121,10 @@ proc unregister*(r: Reactor; fd: cint) =
     r.idle.del(fd)
   if r.deadline.hasKey(fd):
     r.deadline.del(fd)
+  if r.resumeAt.hasKey(fd):
+    r.resumeAt.del(fd)
+  if r.expired.hasKey(fd):
+    r.expired.del(fd)
 
 proc arm(r: Reactor; fd: cint; mask: uint32) =
   ## Ensure epoll is watching `fd` for `mask` (EPOLLIN/EPOLLOUT).
@@ -162,6 +169,29 @@ proc park*(r: Reactor; fd: cint; mask: uint32; k: Continuation) =
   let ms = r.idle.getOrDefault(fd)
   if ms > 0:
     r.deadline[fd] = nowMs() + int64(ms)
+
+proc setResumeDeadline*(r: Reactor; fd: cint; ms: int) =
+  ## A one-shot deadline that RESUMES the coroutine parked on `fd` instead of
+  ## shutting the socket down — the difference between "this peer is dead" and
+  ## "I only meant to wait this long". Call it after `park`, since `park` arms
+  ## the idle deadline and the two share a slot. `ms <= 0` waits forever.
+  ##
+  ## This is what lets a protocol with its OWN timers (QUIC's loss and idle
+  ## timers, a heartbeat, a retry backoff) live on the reactor rather than in a
+  ## private loop.
+  if ms <= 0:
+    if r.deadline.hasKey(fd): r.deadline.del(fd)
+    if r.resumeAt.hasKey(fd): r.resumeAt.del(fd)
+  else:
+    r.deadline[fd] = nowMs() + int64(ms)
+    r.resumeAt[fd] = true
+
+proc takeExpired*(r: Reactor; fd: cint): bool =
+  ## Did the wait on `fd` end because its resume-deadline fired rather than
+  ## because the fd became ready? Reading the answer clears it.
+  result = r.expired.getOrDefault(fd)
+  if result:
+    r.expired.del(fd)
 
 proc requestStop*(r: Reactor; graceful = true) =
   ## Ask `run()` to finish. Safe to call from a coroutine, another thread, or a
@@ -230,8 +260,19 @@ proc expire(r: Reactor) =
     if dl <= t:
       dead.add fd
   for fd in dead:
+    let resume = r.resumeAt.getOrDefault(fd)
     r.deadline.del(fd)
-    discard shutdownTcpBoth(fd)
+    if resume:
+      # A deliberate wait ran out: hand the coroutine back, flagged, and let it
+      # decide what that means.
+      r.resumeAt.del(fd)
+      r.expired[fd] = true
+      if r.waiting.hasKey(fd):
+        let k = r.waiting.getOrDefault(fd)
+        r.waiting.del(fd)
+        complete(k)
+    else:
+      discard shutdownTcpBoth(fd)
 
 # ---------------------------------------------------------------------------
 # the run loop == the scheduler

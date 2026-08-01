@@ -11,6 +11,8 @@ when defined(nimony):
 
 import tcp/epoll as ep
 import quic/quic
+import ./reactor
+import ./asyncio
 
 export H3Request
 
@@ -24,6 +26,43 @@ type
 proc response*(status: int; ctype, body: string): H3Response =
   H3Response(status: status, ctype: ctype, body: body)
 
+var gH3Handler: nil H3Handler = nil
+var gH3Srv: QuicCtx = cast[QuicCtx](0)
+
+proc h3Loop(r: Reactor; fdc: cint) {.passive.} =
+  ## The QUIC server as an ordinary reactor coroutine.
+  ##
+  ## QUIC has timers of its own — loss detection, idle, PTO — so this waits for
+  ## "the socket is readable OR my next timer is due", which is exactly
+  ## `awaitReadableFor`. Before that primitive existed this module ran a private
+  ## epoll loop, which is why HTTP/3 could not share a thread with HTTP/1.1 or
+  ## HTTP/2 even though all three are single-threaded by design.
+  var running = true
+  while running:
+    var tmo = timeoutMs(gH3Srv)
+    if tmo < 0 or tmo > 1000:
+      tmo = 1000                       # cap so loss/idle timers still fire
+    var expired = false
+    r.awaitReadableFor(fdc, tmo, expired)
+    if not expired:
+      discard processRead(gH3Srv)
+    discard handleTimeout(gH3Srv)
+    var req = takeRequest(gH3Srv)
+    while req.ok:
+      let resp = gH3Handler(req.meth, req.path, req.body)
+      respond(gH3Srv, req.id, resp.status, resp.ctype, resp.body)
+      req = takeRequest(gH3Srv)
+    discard flush(gH3Srv)
+
+proc spawnH3*(r: Reactor; srv: QuicCtx; handler: H3Handler) =
+  ## Attach an already-created QUIC server to `r`. Exposed so one process can
+  ## run HTTP/3 next to the TCP servers on the SAME reactor and the same thread.
+  gH3Srv = srv
+  gH3Handler = handler
+  let sfd = cint(fd(srv))
+  r.registerListener(sfd)
+  r.spawn(delay(h3Loop(r, sfd)))
+
 proc serveH3Reactor*(port: int; certPath, keyPath: string; handler: H3Handler;
                      host = "127.0.0.1") =
   ## Serve HTTP/3 on `port` (UDP) with a single-thread epoll reactor. `certPath`
@@ -32,28 +71,10 @@ proc serveH3Reactor*(port: int; certPath, keyPath: string; handler: H3Handler;
   let srv = quicServer(host, port, certPath, keyPath)
   if srv == nil:
     return
-  let sfd = fd(srv)
-  let epfd = ep.epollCreate()
-  ep.epollAdd(epfd, cint(sfd), ep.EPOLLIN)
-  var evs = ep.newEventBuf(64)
-  var running = true
-  while running:
-    var tmo = timeoutMs(srv)
-    if tmo < 0 or tmo > 1000:
-      tmo = 1000                       # cap so QUIC loss/idle timers still fire
-    let n = ep.epollWait(epfd, evs, cint(tmo))
-    var i = 0
-    while i < n:
-      if ep.eventFd(evs, i) == cint(sfd):
-        discard processRead(srv)
-      inc i
-    discard handleTimeout(srv)
-    var req = takeRequest(srv)
-    while req.ok:
-      let r = handler(req.meth, req.path, req.body)
-      respond(srv, req.id, r.status, r.ctype, r.body)
-      req = takeRequest(srv)
-    discard flush(srv)
+  let r = newReactor()
+  r.stopOnSignals()
+  r.spawnH3(srv, handler)
+  r.run()
 
 proc h3Fetch*(host: string; port: int; authority, path: string;
               postBody = ""; maxIters = 200000): tuple[status: int, body: string] =

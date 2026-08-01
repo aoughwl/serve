@@ -171,6 +171,23 @@ proc acceptLoopTlsAlpn(r: Reactor; listenFd: cint) {.passive.} =
       r.setIdleTimeout(fd, gIdleMs)
       r.spawn(delay(dispatchTlsConn(r, fd)))
 
+proc spawnTlsAlpn*(r: Reactor; listenFd: cint; ctx0: TlsContext;
+                   handler: H2Handler; alpn = @["h2", "http/1.1"];
+                   idleTimeoutMs = IdleTimeoutMs) =
+  ## Attach an ALPN-dispatching TLS acceptor to a reactor someone else owns, on
+  ## a listener they opened. Exposed so a process can run this next to other
+  ## servers — HTTP/3 on the same reactor, say (`serve/reactorall.nim`).
+  var ctx = ctx0
+  if not ctx.isValid:
+    return
+  gH2Handler = handler
+  gIdleMs = idleTimeoutMs
+  gAlpnH2Only = alpn.len == 1
+  setReactorHttpHandler(handler, idleTimeoutMs)
+  discard ctx.setAlpnServer(alpn)
+  gTlsCtx = ctx
+  r.spawn(delay(acceptLoopTlsAlpn(r, listenFd)))
+
 proc serveTlsAlpn(port: int; ctx0: TlsContext; alpn: seq[string];
                   idleTimeoutMs: int): bool =
   ## Shared driver for the TLS entry points below. Returns false if the context

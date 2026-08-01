@@ -127,6 +127,22 @@ Defaults: 60 s for HTTP/1.1 and HTTP/2, **off** for WebSocket (a silent
 subscription is not a stalled one). All three take an `idleTimeoutMs` argument.
 *Verified: `tests/reactor_idle_timeout.sh`.*
 
+## Timers that resume, not just timers that kill
+
+The idle timeout above ends a connection. A protocol with timers of its OWN —
+QUIC's loss, idle and PTO timers, a heartbeat, a retry backoff — needs the
+opposite: to be woken *without* anything being torn down.
+
+`awaitReadableFor(fd, ms, timedOut)` is that wait: it returns when the fd is
+readable **or** when `ms` elapses, and says which. Underneath, a
+`setResumeDeadline` marks the deadline as one that resumes the parked
+continuation instead of shutting the socket down. The two share one deadline
+slot per fd, which is why the primitive arms it *after* `park`.
+
+This is what let HTTP/3 stop running a private epoll loop and join the shared
+reactor — and therefore what makes one thread able to serve TCP and QUIC at
+once.
+
 ## Stopping
 
 `run()` used to loop until the process was killed, so the only way to end a
@@ -198,6 +214,14 @@ per connection, all multiplexed on one OS thread:
   plus 19/19 conformance cases (`tests/reactor_ws_conformance.sh`) and 80/80
   across 20 simultaneous TLS clients (`tests/reactor_wss_e2e.sh`), on one
   thread.*
+- **`serve/reactorall.nim`** — **HTTP/1.1 + HTTP/2 + HTTP/3 from one handler**,
+  on one reactor, on one thread. `serveAllReactor(port, cert, key, handler)`
+  serves TLS/TCP on `port` with ALPN dispatch and QUIC/UDP on the same port
+  number, and stamps `Alt-Svc: h3=":<port>"` on every TCP response — without
+  which a browser never tries HTTP/3 at all. HTTP/3's `(method, path, body)` is
+  adapted to the `Request`/`Response` shape here, so callers write one handler.
+  *Verified: all three protocols answering on one port, the HTTP/3 leg driven by
+  third-party **aioquic**, one OS thread* (`tests/reactor_all_e2e.sh`).
 - **`serve/reactorh3.nim`** — async **HTTP/3 (QUIC)**.
   `serveH3Reactor(port, cert, key, handler)` where `handler` is `proc(meth, path,
   body: string): H3Response`. The QUIC transport, TLS 1.3 handshake, connection-ID
@@ -206,8 +230,10 @@ per connection, all multiplexed on one OS thread:
   `quic/build.sh`), exposed to nimony through a small pull-based API
   (`quic/quic.nim`). The reactor owns only the epoll wait on the single UDP fd,
   feeding datagram readiness and QUIC timer expiries into the shim. GET + POST.
-  *Verified: 20 independent QUIC clients (20/20) on one thread*
-  (`tests/reactor_h3_e2e.sh`); the pure-C harness is ASan/LSan-clean.
+  `spawnH3(r, srv, handler)` attaches it to a reactor someone else owns, which
+  is how it shares a thread with the TCP servers. *Verified: 20 independent
+  QUIC clients (20/20) on one thread* (`tests/reactor_h3_e2e.sh`); the pure-C
+  harness is ASan/LSan-clean.
 
 - **WebTransport** (same shim, `AQ_WEBTRANSPORT` — needs vendored nghttp3 ≥ 1.x
   from `quic/build-nghttp3.sh`). A session is an HTTP/3 extended CONNECT with

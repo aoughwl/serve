@@ -33,6 +33,19 @@ template awaitAccept*(r: Reactor; listenFd: cint; fdOut: var TcpHandle) =
         r.park(listenFd, ep.EPOLLIN, k)
         suspend()
 
+template awaitReadableFor*(r: Reactor; fd: cint; ms: int; timedOut: var bool) =
+  ## Suspend until `fd` is readable, or until `ms` milliseconds pass — whichever
+  ## comes first; `timedOut` says which. No I/O is attempted: this is the wait
+  ## itself, for a protocol that has its own timers to service (QUIC's loss and
+  ## idle timers, a heartbeat) and must be woken whether or not a packet came.
+  ## `ms <= 0` waits indefinitely.
+  timedOut = false
+  let k = delay()
+  r.park(fd, ep.EPOLLIN, k)
+  r.setResumeDeadline(fd, ms)   # after park: park arms the idle deadline, same slot
+  suspend()
+  timedOut = r.takeExpired(fd)
+
 template awaitRead*(r: Reactor; fd: cint; buf: pointer; n: int; got: var int) =
   ## Read up to `n` bytes into `buf`, suspending until readable. `got` is set to
   ## >0 (bytes), 0 (orderly EOF), or -1 (hard error).
