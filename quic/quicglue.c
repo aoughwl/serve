@@ -40,6 +40,7 @@
 
 #define MAX_CONNS 64
 #define MAX_STREAMS 64
+#define MAX_WT 32
 #define MAX_CIDS 256
 #define MAX_REQ 256
 #define SEND_BUF 1452
@@ -63,6 +64,31 @@ typedef struct {
   int has_response;
 } Stream;
 
+/* ---- WebTransport streams --------------------------------------------- */
+/* A WebTransport stream is an ordinary QUIC stream whose *initiator* prefixes it
+ * with a signal: on a bidi stream the frame type 0x41, on a uni stream the
+ * stream type 0x54, each followed by a varint session id (the CONNECT stream id
+ * divided by 4). Everything after that prefix is opaque application payload —
+ * it never reaches nghttp3, so we route these streams ourselves. */
+#define WT_BIDI_SIGNAL 0x41
+#define WT_UNI_SIGNAL  0x54
+
+typedef struct {
+  int used;
+  int64_t id;
+  int64_t session;
+  int is_uni;
+  int incoming;       /* opened by the peer */
+  int hdr_done;       /* the signal prefix has been parsed (in) / built (out) */
+  int rejected;       /* classified as a plain H3 stream, not WebTransport */
+  int taken;          /* handed to the application by aq_wt_take_stream */
+  uint8_t pre[16]; int pre_len;         /* prefix bytes held for classification */
+  char *rbuf; int rlen, rcap, roff;     /* received payload */
+  int fin;                              /* peer finished the stream */
+  char *sbuf; int slen, soff, scap;     /* payload to send (prefix included) */
+  int send_fin, fin_sent;
+} WtStream;
+
 /* ---- a QUIC connection ------------------------------------------------ */
 typedef struct Conn {
   int used;
@@ -78,7 +104,8 @@ typedef struct Conn {
   struct sockaddr_storage local;  socklen_t locallen;
   Stream streams[MAX_STREAMS];
   int64_t ctrl_id, qpack_enc_id, qpack_dec_id;
-  int wt_active; int64_t wt_session;     /* WebTransport session (server) */
+  int wt_active; int64_t wt_session;     /* WebTransport session stream */
+  WtStream wt[MAX_WT];                   /* WebTransport streams on it */
   char *odg[8]; int odg_len[8]; int odg_head, odg_n;   /* outgoing datagrams */
 } Conn;
 
@@ -191,6 +218,76 @@ static void rbody_append(Stream *s, const uint8_t *d, size_t n) {
   s->rbody[s->rbody_len] = 0;
 }
 
+#if AQ_WEBTRANSPORT
+/* ---- WebTransport stream table ---------------------------------------- */
+static WtStream *wt_find(Conn *cn, int64_t id) {
+  for (int i = 0; i < MAX_WT; i++)
+    if (cn->wt[i].used && cn->wt[i].id == id) return &cn->wt[i];
+  return NULL;
+}
+
+static WtStream *wt_alloc(Conn *cn, int64_t id, int incoming) {
+  for (int i = 0; i < MAX_WT; i++)
+    if (!cn->wt[i].used) {
+      memset(&cn->wt[i], 0, sizeof(WtStream));
+      cn->wt[i].used = 1; cn->wt[i].id = id; cn->wt[i].incoming = incoming;
+      cn->wt[i].is_uni = (id & 0x2) != 0;
+      cn->wt[i].session = cn->wt_session;
+      return &cn->wt[i];
+    }
+  return NULL;
+}
+
+static void wt_rappend(WtStream *w, const uint8_t *d, size_t n) {
+  if (n == 0) return;
+  if (w->rlen + (int)n > w->rcap) {
+    int nc = w->rcap ? w->rcap * 2 : 4096;
+    while (nc < w->rlen + (int)n) nc *= 2;
+    w->rbuf = realloc(w->rbuf, nc); w->rcap = nc;
+  }
+  memcpy(w->rbuf + w->rlen, d, n); w->rlen += (int)n;
+}
+
+static void wt_sappend(WtStream *w, const uint8_t *d, size_t n) {
+  if (n == 0) return;
+  int need = w->slen + (int)n;
+  if (need > w->scap) {
+    int nc = w->scap ? w->scap * 2 : 4096;
+    while (nc < need) nc *= 2;
+    w->sbuf = realloc(w->sbuf, nc); w->scap = nc;
+  }
+  memcpy(w->sbuf + w->slen, d, n); w->slen = need;
+}
+
+/* Feed freshly-received stream bytes to a (possible) WebTransport stream.
+ * Returns 1 when the bytes belong to WebTransport and were consumed, 0 when the
+ * stream turns out to be a plain HTTP/3 stream (`w->rejected` is then set and
+ * the held prefix has NOT been consumed — the caller replays it into nghttp3). */
+static int wt_ingest(WtStream *w, const uint8_t *data, size_t datalen, int fin) {
+  const uint8_t *p = data; size_t n = datalen;
+  if (!w->hdr_done) {
+    while (n > 0 && w->pre_len < (int)sizeof(w->pre)) {
+      w->pre[w->pre_len++] = *p++; n--;
+    }
+    uint64_t type = 0, sess = 0;
+    size_t c1 = varint_decode(w->pre, (size_t)w->pre_len, &type);
+    if (c1 == 0) return 1;               /* need more bytes to classify */
+    uint64_t want = w->is_uni ? WT_UNI_SIGNAL : WT_BIDI_SIGNAL;
+    if (type != want) { w->rejected = 1; return 0; }
+    size_t c2 = varint_decode(w->pre + c1, (size_t)w->pre_len - c1, &sess);
+    if (c2 == 0) return 1;               /* session id still incomplete */
+    w->hdr_done = 1;
+    w->session = (int64_t)(sess * 4);
+    int left = w->pre_len - (int)(c1 + c2);
+    if (left > 0) wt_rappend(w, w->pre + c1 + c2, (size_t)left);
+    w->pre_len = 0;
+  }
+  wt_rappend(w, p, n);
+  if (fin) w->fin = 1;
+  return 1;
+}
+#endif
+
 /* get_conn callback for ngtcp2 crypto (gnutls) */
 static ngtcp2_conn *get_conn_cb(ngtcp2_crypto_conn_ref *ref) {
   return ((Conn *)ref->user_data)->conn;
@@ -224,7 +321,12 @@ static int h3_recv_header(nghttp3_conn *h3, int64_t stream_id,
     if (nv.len == 7 && memcmp(nv.base, ":status", 7) == 0) {
       char tmp[8] = {0}; int n = vv.len < 7 ? (int)vv.len : 7;
       memcpy(tmp, vv.base, n); s->status = atoi(tmp);
-      if (cn->ctx->cli_wt && s->status == 200) cn->ctx->cli_wt_ready = 1;
+      if (cn->ctx->cli_wt && s->status == 200) {
+        cn->ctx->cli_wt_ready = 1;
+        /* the CONNECT stream IS the session — record it like the server does so
+         * the WebTransport stream paths are symmetric on both ends. */
+        cn->wt_active = 1; cn->wt_session = stream_id;
+      }
     }
   }
   return 0;
@@ -345,6 +447,36 @@ static int ng_recv_stream_data(ngtcp2_conn *conn, uint32_t flags,
   Conn *cn = user_data;
   int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
   if (!cn->h3) return 0;
+#if AQ_WEBTRANSPORT
+  /* WebTransport streams are routed here, never into nghttp3. A peer-initiated
+   * stream is classified from its first bytes; one we opened ourselves is
+   * already in the table (and carries no signal prefix in this direction). */
+  if (cn->wt_active && stream_id != cn->wt_session) {
+    WtStream *w = wt_find(cn, stream_id);
+    int peer = cn->ctx->is_server ? ((stream_id & 1) == 0) : ((stream_id & 1) == 1);
+    if (!w && peer) w = wt_alloc(cn, stream_id, 1);
+    if (w && !w->rejected) {
+      int before = w->pre_len;
+      if (wt_ingest(w, data, datalen, fin)) {
+        ngtcp2_conn_extend_max_stream_offset(conn, stream_id, datalen);
+        ngtcp2_conn_extend_max_offset(conn, datalen);
+        return 0;
+      }
+      /* Not WebTransport after all. `w->pre` holds the stream's opening bytes —
+       * replay all of them into HTTP/3, then fall through with what is left of
+       * this call (which may be nothing, in which case only `fin` carries over).
+       * Bytes held by earlier calls already got their flow-control credit. */
+      if (w->pre_len > 0 &&
+          nghttp3_conn_read_stream(cn->h3, stream_id, w->pre,
+                                   (size_t)w->pre_len, 0) < 0)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      size_t took = (size_t)(w->pre_len - before);
+      ngtcp2_conn_extend_max_stream_offset(conn, stream_id, took);
+      ngtcp2_conn_extend_max_offset(conn, took);
+      data += took; datalen -= took;
+    }
+  }
+#endif
   nghttp3_ssize n = nghttp3_conn_read_stream(cn->h3, stream_id, data, datalen, fin);
   if (n < 0) return NGTCP2_ERR_CALLBACK_FAILURE;
   ngtcp2_conn_extend_max_stream_offset(conn, stream_id, (uint64_t)n);
@@ -366,6 +498,10 @@ static int ng_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                            void *stream_user_data) {
   (void)conn; (void)stream_user_data;
   Conn *cn = user_data;
+#if AQ_WEBTRANSPORT
+  { WtStream *w = wt_find(cn, stream_id);
+    if (w && !w->rejected) { w->fin = 1; return 0; }   /* nghttp3 never saw it */ }
+#endif
   if (cn->h3) {
     if (!(flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET))
       app_error_code = NGHTTP3_H3_NO_ERROR;
@@ -450,7 +586,7 @@ static void fill_callbacks(ngtcp2_callbacks *cb, int server) {
 static void default_tp(ngtcp2_transport_params *p) {
   ngtcp2_transport_params_default(p);
   p->initial_max_streams_bidi = 100;
-  p->initial_max_streams_uni = 3;
+  p->initial_max_streams_uni = 100;   /* 3 H3 control streams + WebTransport uni */
   p->initial_max_stream_data_bidi_local = 256 * 1024;
   p->initial_max_stream_data_bidi_remote = 256 * 1024;
   p->initial_max_stream_data_uni = 256 * 1024;
@@ -676,6 +812,11 @@ static void conn_close(aq_ctx *c, Conn *cn) {
     if (cn->streams[i].sbody) free(cn->streams[i].sbody);
   }
   for (int i = 0; i < 8; i++) if (cn->odg[i]) { free(cn->odg[i]); cn->odg[i] = NULL; }
+  for (int i = 0; i < MAX_WT; i++) {
+    if (cn->wt[i].rbuf) { free(cn->wt[i].rbuf); cn->wt[i].rbuf = NULL; }
+    if (cn->wt[i].sbuf) { free(cn->wt[i].sbuf); cn->wt[i].sbuf = NULL; }
+    cn->wt[i].used = 0;
+  }
   cn->used = 0;
 }
 
@@ -716,6 +857,43 @@ static int conn_write(aq_ctx *c, Conn *cn) {
     sendto(c->fd, buf, (size_t)nwrite, 0,
            (struct sockaddr *)&cn->remote, cn->remotelen);
   }
+#if AQ_WEBTRANSPORT
+  /* WebTransport stream payload: written straight onto its QUIC stream, since
+   * nghttp3 knows nothing about these streams. One packet per call (no
+   * WRITE_MORE coalescing) — correctness first, and WT payloads are bulk data
+   * that fills packets anyway. */
+  for (int i = 0; i < MAX_WT; i++) {
+    WtStream *w = &cn->wt[i];
+    if (!w->used || w->rejected) continue;
+    while (w->soff < w->slen || (w->send_fin && !w->fin_sent)) {
+      size_t remain = (size_t)(w->slen - w->soff);
+      ngtcp2_vec v;
+      v.base = (uint8_t *)(w->sbuf + w->soff);
+      v.len = remain;
+      uint32_t sflags = NGTCP2_WRITE_STREAM_FLAG_NONE;
+      if (w->send_fin) sflags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+      ngtcp2_ssize ndatalen = 0;
+      ngtcp2_ssize nw = ngtcp2_conn_writev_stream(
+          cn->conn, &path, &pi, buf, sizeof(buf), &ndatalen, sflags, w->id,
+          remain > 0 ? &v : NULL, remain > 0 ? 1 : 0, ts);
+      if (nw < 0) {
+        if (nw == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
+            nw == NGTCP2_ERR_STREAM_SHUT_WR || nw == NGTCP2_ERR_STREAM_NOT_FOUND)
+          break;
+        DBG("wt writev err=%zd %s\n", (ssize_t)nw, ngtcp2_strerror((int)nw));
+        conn_close(c, cn);
+        return -1;
+      }
+      if (ndatalen > 0) w->soff += (int)ndatalen;
+      if (nw == 0) break;               /* congestion/flow limited for now */
+      sendto(c->fd, buf, (size_t)nw, 0,
+             (struct sockaddr *)&cn->remote, cn->remotelen);
+      /* ngtcp2 only carries the FIN once the whole offered buffer went out */
+      if (w->send_fin && (ngtcp2_ssize)remain == (ndatalen > 0 ? ndatalen : 0))
+        w->fin_sent = 1;
+    }
+  }
+#endif
   /* drain queued outgoing datagrams (only once the handshake can carry them) */
   while (cn->handshake_done && cn->odg_n > 0) {
     int h = cn->odg_head;
@@ -1033,6 +1211,117 @@ int aq_client_wt_send_datagram(aq_ctx *c, const char *data, int len) {
   }
 #endif
   (void)c; (void)data; (void)len; return -1;
+}
+
+/* ---- WebTransport streams (bidi + uni) -------------------------------- */
+int aq_conn_token(aq_ctx *c) {
+  /* the first live connection — a client has exactly one, so this is how a
+   * client names its connection for the shared WebTransport stream API */
+  for (int i = 0; i < MAX_CONNS; i++) if (c->conns[i].used) return i;
+  return -1;
+}
+
+#if AQ_WEBTRANSPORT
+static Conn *wt_conn(aq_ctx *c, uint64_t tok) {
+  if (tok >= MAX_CONNS || !c->conns[tok].used) return NULL;
+  Conn *cn = &c->conns[tok];
+  return cn->wt_active ? cn : NULL;
+}
+#endif
+
+int64_t aq_wt_open_stream(aq_ctx *c, uint64_t conn_token, int uni) {
+#if AQ_WEBTRANSPORT
+  Conn *cn = wt_conn(c, conn_token);
+  if (!cn) return -1;
+  int64_t sid = -1;
+  int rv = uni ? ngtcp2_conn_open_uni_stream(cn->conn, &sid, NULL)
+               : ngtcp2_conn_open_bidi_stream(cn->conn, &sid, NULL);
+  if (rv != 0) return -1;
+  WtStream *w = wt_alloc(cn, sid, 0);
+  if (!w) return -1;
+  w->hdr_done = 1;       /* we emit the signal prefix; nothing to parse inbound */
+  w->is_uni = uni ? 1 : 0;
+  w->session = cn->wt_session;
+  uint8_t hdr[16]; size_t hn = 0;
+  hn += varint_encode(hdr, uni ? WT_UNI_SIGNAL : WT_BIDI_SIGNAL);
+  hn += varint_encode(hdr + hn, (uint64_t)(cn->wt_session / 4));
+  wt_sappend(w, hdr, hn);
+  conn_write(c, cn);
+  return sid;
+#else
+  (void)c; (void)conn_token; (void)uni; return -1;
+#endif
+}
+
+int aq_wt_stream_send(aq_ctx *c, uint64_t conn_token, int64_t stream_id,
+                      const char *data, int len, int fin) {
+#if AQ_WEBTRANSPORT
+  Conn *cn = wt_conn(c, conn_token);
+  if (!cn) return -1;
+  WtStream *w = wt_find(cn, stream_id);
+  if (!w || w->rejected) return -1;
+  if (w->is_uni && w->incoming) return -1;      /* peer's uni stream: read-only */
+  if (len > 0) wt_sappend(w, (const uint8_t *)data, (size_t)len);
+  if (fin) w->send_fin = 1;
+  conn_write(c, cn);
+  return 0;
+#else
+  (void)c; (void)conn_token; (void)stream_id; (void)data; (void)len; (void)fin;
+  return -1;
+#endif
+}
+
+int aq_wt_take_stream(aq_ctx *c, uint64_t *conn_token, int64_t *stream_id,
+                      int *uni) {
+#if AQ_WEBTRANSPORT
+  for (int i = 0; i < MAX_CONNS; i++) {
+    Conn *cn = &c->conns[i];
+    if (!cn->used || !cn->wt_active) continue;
+    for (int j = 0; j < MAX_WT; j++) {
+      WtStream *w = &cn->wt[j];
+      if (!w->used || w->taken || w->rejected || !w->incoming || !w->hdr_done)
+        continue;
+      w->taken = 1;
+      *conn_token = (uint64_t)i; *stream_id = w->id; *uni = w->is_uni;
+      return 1;
+    }
+  }
+#else
+  (void)c; (void)conn_token; (void)stream_id; (void)uni;
+#endif
+  return 0;
+}
+
+int aq_wt_stream_recv(aq_ctx *c, uint64_t conn_token, int64_t stream_id,
+                      char *buf, int cap) {
+#if AQ_WEBTRANSPORT
+  Conn *cn = wt_conn(c, conn_token);
+  if (!cn) return 0;
+  WtStream *w = wt_find(cn, stream_id);
+  if (!w || w->rejected) return 0;
+  int avail = w->rlen - w->roff;
+  if (avail <= 0) return 0;
+  int n = avail < cap ? avail : cap;
+  memcpy(buf, w->rbuf + w->roff, n);
+  w->roff += n;
+  if (w->roff == w->rlen) { w->roff = 0; w->rlen = 0; }
+  return n;
+#else
+  (void)c; (void)conn_token; (void)stream_id; (void)buf; (void)cap; return 0;
+#endif
+}
+
+int aq_wt_stream_fin(aq_ctx *c, uint64_t conn_token, int64_t stream_id) {
+#if AQ_WEBTRANSPORT
+  Conn *cn = wt_conn(c, conn_token);
+  if (!cn) return 0;
+  WtStream *w = wt_find(cn, stream_id);
+  /* "the peer finished" — only once everything it sent has been read out */
+  if (w && w->fin && w->roff >= w->rlen) return 1;
+#else
+  (void)c; (void)conn_token; (void)stream_id;
+#endif
+  return 0;
 }
 
 int aq_client_done(aq_ctx *c) {

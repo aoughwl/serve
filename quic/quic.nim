@@ -45,6 +45,20 @@ proc aqClientWtSendDatagram(c: QuicCtx; data: ptr char; len: cint): cint
   {.importc: "aq_client_wt_send_datagram", dynlib: lib.}
 proc aqWtSendDatagram(c: QuicCtx; connToken: uint64; data: ptr char; len: cint): cint
   {.importc: "aq_wt_send_datagram", dynlib: lib.}
+proc aqConnToken(c: QuicCtx): cint {.importc: "aq_conn_token", dynlib: lib.}
+proc aqWtOpenStream(c: QuicCtx; connToken: uint64; uni: cint): int64
+  {.importc: "aq_wt_open_stream", dynlib: lib.}
+proc aqWtStreamSend(c: QuicCtx; connToken: uint64; streamId: int64;
+                    data: ptr char; len: cint; fin: cint): cint
+  {.importc: "aq_wt_stream_send", dynlib: lib.}
+proc aqWtTakeStream(c: QuicCtx; connToken: ptr uint64; streamId: ptr int64;
+                    uni: ptr cint): cint
+  {.importc: "aq_wt_take_stream", dynlib: lib.}
+proc aqWtStreamRecv(c: QuicCtx; connToken: uint64; streamId: int64;
+                    buf: ptr char; cap: cint): cint
+  {.importc: "aq_wt_stream_recv", dynlib: lib.}
+proc aqWtStreamFin(c: QuicCtx; connToken: uint64; streamId: int64): cint
+  {.importc: "aq_wt_stream_fin", dynlib: lib.}
 proc aqClientDone(c: QuicCtx): cint {.importc: "aq_client_done", dynlib: lib.}
 proc aqClientStatus(c: QuicCtx): cint {.importc: "aq_client_status", dynlib: lib.}
 proc aqClientBody(c: QuicCtx; buf: ptr char; cap: cint): cint
@@ -199,6 +213,69 @@ proc clientWtSendDatagram*(c: QuicCtx; data: string) =
     buf[i] = data[i]
     inc i
   discard aqClientWtSendDatagram(c, addr buf[0], cint(buf.len))
+
+proc connToken*(c: QuicCtx): int =
+  ## The first live connection's token. A client has exactly one connection, so
+  ## this is how a client names it for the WebTransport stream API; -1 if none.
+  int(aqConnToken(c))
+
+# ---- WebTransport streams (reliable, ordered — bidi and uni) ----------------
+type WtStream* = object
+  ok*: bool
+  connToken*: uint64
+  id*: int64            ## the QUIC stream id
+  uni*: bool            ## unidirectional (receive-only for the accepting peer)
+
+proc wtOpenStream*(c: QuicCtx; connToken: uint64; uni = false): int64 =
+  ## Open a WebTransport stream on an established session. Returns the stream id,
+  ## or -1 if the session is not established / no stream credit is available.
+  ## The `WEBTRANSPORT_STREAM` signal prefix is written for you.
+  aqWtOpenStream(c, connToken, if uni: 1.cint else: 0.cint)
+
+proc wtTakeStream*(c: QuicCtx): WtStream =
+  ## Pull one newly-accepted incoming WebTransport stream (`ok = false` if none).
+  result = default(WtStream)
+  var tok = 0'u64
+  var sid = 0'i64
+  var uni = 0.cint
+  if aqWtTakeStream(c, addr tok, addr sid, addr uni) == 1.cint:
+    result.ok = true
+    result.connToken = tok
+    result.id = sid
+    result.uni = uni == 1.cint
+
+proc wtStreamSend*(c: QuicCtx; connToken: uint64; streamId: int64;
+                   data: string; fin = false) =
+  ## Append `data` to a WebTransport stream (sent on the next flush). `fin`
+  ## half-closes the sending side once the buffered payload has gone out.
+  if data.len == 0:
+    if fin:
+      discard aqWtStreamSend(c, connToken, streamId, cast[ptr char](0), 0.cint,
+                             1.cint)
+    return
+  var buf = newSeq[char](data.len)
+  var i = 0
+  while i < data.len:
+    buf[i] = data[i]
+    inc i
+  discard aqWtStreamSend(c, connToken, streamId, addr buf[0], cint(buf.len),
+                         if fin: 1.cint else: 0.cint)
+
+proc wtStreamRecv*(c: QuicCtx; connToken: uint64; streamId: int64;
+                   maxLen = 65536): string =
+  ## Read whatever payload has arrived on a WebTransport stream ("" if none).
+  var buf = newSeq[char](maxLen)
+  let n = aqWtStreamRecv(c, connToken, streamId, addr buf[0], cint(maxLen))
+  result = ""
+  var i = 0
+  while i < n:
+    result.add buf[i]
+    inc i
+
+proc wtStreamFin*(c: QuicCtx; connToken: uint64; streamId: int64): bool =
+  ## True once the peer has finished the stream AND everything it sent has been
+  ## read out by `wtStreamRecv`.
+  aqWtStreamFin(c, connToken, streamId) == 1.cint
 
 proc wtSendDatagram*(c: QuicCtx; connToken: uint64; data: string) =
   ## Send a WebTransport datagram on a server session (identified by the
