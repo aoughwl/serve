@@ -37,11 +37,25 @@ type
     counter*: int        ## free for the producer (event number, retry count, …)
     limit*: int          ## free for the producer (how many events to send, …)
     text*: string        ## free for the producer (a template, a prefix, …)
+    pauseMs*: int        ## ask the transport to wait this long before the next call
+
+  # `pauseMs` is how a producer PACES itself. It cannot sleep — it runs on the
+  # reactor thread, so a sleep would stop every other connection — so instead it
+  # says how long to wait and the transport parks the coroutine for that long,
+  # on this connection's socket. Waiting on the socket rather than a bare timer
+  # is deliberate: a client that disconnects mid-pause makes the socket readable
+  # and the wait ends early, so a feed nobody is listening to stops promptly
+  # instead of at its next tick.
 
   ChunkProducer* = proc(st: var StreamState; chunk: var string): bool {.nimcall.}
     ## Fill `chunk` with the next piece and return true, or return false when
     ## the body is complete. Returning true with an EMPTY chunk is allowed and
     ## means "nothing right now" — the caller does not treat it as the end.
+    ##
+    ## A producer that wants to be called again later sets `st.pauseMs`. One
+    ## that returns empty chunks with no pause is spinning the reactor thread;
+    ## the transport counts that and ends the stream rather than burning a core
+    ## quietly (`streamSpinAborts`).
 
   StreamResponse* = object
     ## A response the server writes incrementally. `headers` are sent as given;
@@ -63,7 +77,7 @@ type
 
 proc emptyState*(): StreamState =
   StreamState(file: default(File), hasFile: false, remaining: -1'i64,
-              counter: 0, limit: 0, text: "")
+              counter: 0, limit: 0, text: "", pauseMs: 0)
 
 proc noBody(st: var StreamState; chunk: var string): bool {.nimcall.} =
   chunk = ""
@@ -138,7 +152,7 @@ proc fileStream*(path: string; contentType: string; status = 200;
                           headers: @[], producer: fileProducer,
                           state: StreamState(file: f, hasFile: true,
                                              remaining: length, counter: 0,
-                                             limit: 0, text: ""),
+                                             limit: 0, text: "", pauseMs: 0),
                           contentLength: declared)
 
 proc sseEvent*(data: string; event = ""; id = ""): string =

@@ -60,6 +60,18 @@ proc neverStream(req: Request): bool {.nimcall.} =
 var gStreamHandler: ReactorStreamHandler = noStream
 var gWantsStream: StreamPredicate = neverStream
 
+const MaxEmptySpins = 1000
+  ## Consecutive empty chunks with no `pauseMs` before the transport gives up on
+  ## a producer. That pattern is a busy loop on the reactor thread, i.e. a bug in
+  ## the producer; ending the stream and counting it beats burning a core in
+  ## silence.
+
+var gStreamSpinAborts = 0
+
+proc streamSpinAborts*(): int =
+  ## Streams ended because their producer spun: empty chunk, no pause, forever.
+  gStreamSpinAborts
+
 proc setReactorStreamHandler*(handler: ReactorStreamHandler;
                               wants: StreamPredicate) =
   ## Install a streaming handler and the predicate that decides which requests
@@ -263,10 +275,17 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
         let chunkedOut = chunksFramed(sr, req.version)
         let wantBody = not isMethod(req, "HEAD")
         var producing = streamOk and wantBody
+        var spins = 0
         while producing:
           var piece = ""
+          sr.state.pauseMs = 0
           if not sr.producer(sr.state, piece):
             producing = false
+          elif piece.len == 0 and sr.state.pauseMs <= 0:
+            inc spins
+            if spins >= MaxEmptySpins:
+              inc gStreamSpinAborts
+              producing = false
           elif piece.len > 0:
             var framed = ""
             if chunkedOut:
@@ -281,12 +300,31 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
               pbuf[pi] = framed[pi]
               inc pi
             var pok = false
+            spins = 0
             r.awaitConnWriteAll(c, addr pbuf[0], pbuf.len, pok)
             if not pok:
               # The client went away mid-stream. That is the NORMAL end of an
               # event stream, not an error — stop producing and close.
               producing = false
               streamOk = false
+          # --- pacing ---------------------------------------------------------
+          # A producer cannot sleep: it runs on this thread. It asks for a delay
+          # instead, and the wait happens on the CONNECTION, so a client that
+          # disconnects mid-pause ends the stream at once rather than at the
+          # next tick.
+          if producing and sr.state.pauseMs > 0:
+            spins = 0
+            var woke = false
+            r.awaitReadableFor(c.fd, sr.state.pauseMs, woke)
+            if not woke:
+              # Readable before the deadline: either the peer sent something on
+              # a stream it is only supposed to read, or it hung up. A zero-byte
+              # read is the hang-up.
+              var probe = default(array[512, char])
+              let n = readTcp(c.fd, addr probe[0], 512)
+              if n == 0:
+                producing = false
+                streamOk = false
         if streamOk and chunkedOut and wantBody:
           var term = newSeq[char](5)
           let t = "0\r\n\r\n"

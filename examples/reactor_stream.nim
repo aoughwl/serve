@@ -19,6 +19,7 @@ import http/response
 const Events = 5
 
 var gFilePath = ""
+var gTickMs = 0
 
 proc lastPathPart(p: string): string =
   result = p
@@ -53,19 +54,35 @@ proc handler(req: Request): Response {.nimcall.} =
   response(404, "text/plain", "not found\n")
 
 proc wantsStream(req: Request): bool {.nimcall.} =
-  req.path == "/events" or req.path == "/file" or req.path == "/static"
+  req.path == "/events" or req.path == "/file" or req.path == "/static" or
+    req.path == "/spin"
 
 proc tickProducer(st: var StreamState; chunk: var string): bool {.nimcall.} =
-  ## One event per call, `st.limit` of them, then done. A real feed would return
-  ## an empty chunk when it has nothing yet rather than ending.
+  ## One event per call, `st.limit` of them, then done — PACED by `pauseMs`
+  ## rather than by sleeping, which would stop every other connection on this
+  ## thread. `st.text` carries the interval so the route can choose it.
   if st.counter >= st.limit:
     chunk = ""
     return false
   inc st.counter
   chunk = sseEvent("tick " & $st.counter, "tick", $st.counter)
+  var ms = 0
+  try: ms = parseInt(st.text)
+  except: ms = 0
+  st.pauseMs = ms
+  true
+
+proc spinProducer(st: var StreamState; chunk: var string): bool {.nimcall.} =
+  ## A DELIBERATELY broken producer: always "nothing right now", never a pause.
+  ## That is a busy loop on the reactor thread, and the transport is supposed to
+  ## notice and end the stream rather than burn a core quietly. Here so the
+  ## guard is exercised instead of assumed.
+  chunk = ""
   true
 
 proc streamHandler(req: Request): StreamResponse {.nimcall.} =
+  if req.path == "/spin":
+    return sseStream(spinProducer, emptyState())
   if req.path == "/file" and gFilePath.len > 0:
     return fileStream(gFilePath, "application/octet-stream")
   if req.path == "/static" and gFilePath.len > 0:
@@ -77,6 +94,7 @@ proc streamHandler(req: Request): StreamResponse {.nimcall.} =
     return staticStreamFor(parentDirOf(gFilePath), r2)
   var st = emptyState()
   st.limit = Events
+  st.text = $gTickMs          # interval between events, in ms
   sseStream(tickProducer, st)
 
 var port = 8190
@@ -85,6 +103,9 @@ if paramCount() >= 1:
   except: port = 8190
 if paramCount() >= 2:
   gFilePath = paramStr(2)
+if paramCount() >= 3:
+  try: gTickMs = parseInt(paramStr(3))
+  except: gTickMs = 0
 
 setReactorStreamHandler(streamHandler, wantsStream)
 serveHttpReactor(port, handler)

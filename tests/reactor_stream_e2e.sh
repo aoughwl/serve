@@ -22,7 +22,8 @@ BIN="$(build_example "$ROOT" "$NC" reactor_stream)" || BIN=""
 dd if=/dev/urandom of="$NC/big.bin" bs=1M count="$SIZE_MB" status=none
 WANT="$(md5sum "$NC/big.bin" | cut -d' ' -f1)"
 
-"$BIN" "$PORT" "$NC/big.bin" >/dev/null 2>&1 &
+TICK_MS="${TICK_MS:-300}"
+"$BIN" "$PORT" "$NC/big.bin" "$TICK_MS" >/dev/null 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true; rm -rf "$NC"' EXIT
 sleep 0.7
@@ -41,6 +42,63 @@ echo "$HEAD" | grep -qi 'transfer-encoding: chunked' || fail "SSE was not chunke
 echo "$HEAD" | grep -qi 'content-type: text/event-stream' || fail "wrong SSE content type"
 echo "$HEAD" | grep -qi 'x-accel-buffering: no' || fail "missing the no-proxy-buffering header"
 echo "sse: 5 events, chunked, correctly framed"
+
+# --- pacing: the producer must not sleep, and must not spin -------------------
+# Five events at TICK_MS apart should take about 4 intervals; a producer that
+# ignored the pause would finish instantly and one that slept would block the
+# thread. Both are checked: the elapsed time, and a plain request served WHILE a
+# paced stream is mid-pause.
+T0="$(date +%s%N)"
+curl -sN --max-time 30 "http://127.0.0.1:$PORT/events" >/dev/null
+PACED_MS=$(( ( $(date +%s%N) - T0 ) / 1000000 ))
+MIN_MS=$(( TICK_MS * 3 ))
+echo "5 events at ${TICK_MS}ms took ${PACED_MS}ms (expected >= ${MIN_MS}ms)"
+(( PACED_MS >= MIN_MS )) || fail "the stream ignored pauseMs — events were not paced"
+
+curl -sN --max-time 30 "http://127.0.0.1:$PORT/events" >/dev/null &
+SSE_PID=$!
+sleep 0.4
+T1="$(date +%s%N)"
+BODY_MID="$(curl -s --max-time 5 "http://127.0.0.1:$PORT/hello")"
+MID_MS=$(( ( $(date +%s%N) - T1 ) / 1000000 ))
+wait $SSE_PID 2>/dev/null || true
+[[ "$BODY_MID" == "hello, not streamed" ]] || fail "request during a paced stream failed: $BODY_MID"
+echo "a plain request mid-pause was served in ${MID_MS}ms"
+(( MID_MS < TICK_MS )) || fail "the pause blocked the reactor thread for ${MID_MS}ms"
+
+# --- and a disconnect during a pause ends the stream at once ------------------
+# On a SEPARATE server with a deliberately slow feed (5s between events), so the
+# stream cannot simply have run to completion: the socket must go when the
+# client does, not at the next tick. Otherwise a feed nobody is listening to
+# holds its coroutine and its fd for as long as its interval.
+SLOWPORT=$(( PORT + 1 ))
+"$BIN" "$SLOWPORT" "$NC/big.bin" 5000 >/dev/null 2>&1 &
+SLOW=$!
+sleep 0.5
+FD_IDLE="$(ls /proc/$SLOW/fd | wc -l)"
+curl -sN --max-time 30 "http://127.0.0.1:$SLOWPORT/events" >/dev/null &
+CPID=$!
+sleep 0.6
+FD_OPEN="$(ls /proc/$SLOW/fd | wc -l)"
+(( FD_OPEN > FD_IDLE )) || { kill $SLOW $CPID 2>/dev/null; fail "the slow stream never opened a connection (idle $FD_IDLE, open $FD_OPEN)"; }
+kill -9 $CPID 2>/dev/null || true
+sleep 1.0                                  # a fifth of one tick
+FD_GONE="$(ls /proc/$SLOW/fd | wc -l)"
+kill $SLOW 2>/dev/null || true
+echo "slow-feed fds idle/open/after-disconnect: $FD_IDLE / $FD_OPEN / $FD_GONE"
+(( FD_GONE <= FD_IDLE )) || fail "an abandoned slow stream held its socket past the disconnect"
+
+# --- a producer that spins is ended, not tolerated ---------------------------
+# /spin always says "nothing right now" and never asks for a pause, which is a
+# busy loop on the reactor thread. The transport must end that stream. Exercised
+# rather than assumed: an unexercised guard is a guess.
+T2="$(date +%s%N)"
+timeout 15 curl -sN "http://127.0.0.1:$PORT/spin" >/dev/null 2>&1 || true
+SPIN_MS=$(( ( $(date +%s%N) - T2 ) / 1000000 ))
+echo "a spinning producer was cut off after ${SPIN_MS}ms"
+(( SPIN_MS < 5000 )) || fail "a spinning producer was allowed to run — the guard did not fire"
+BODY_AFTER="$(curl -s --max-time 10 "http://127.0.0.1:$PORT/hello")"
+[[ "$BODY_AFTER" == "hello, not streamed" ]] || fail "server unhealthy after a spinning producer"
 
 # --- the large download ------------------------------------------------------
 GOT="$(curl -s --max-time 120 "http://127.0.0.1:$PORT/file" | md5sum | cut -d' ' -f1)"

@@ -162,9 +162,22 @@ while the server's PEAK RSS stays at ~7 MB. Materialising the body would put the
 whole file in that number, so the memory figure is the assertion; the checksum
 is only the sanity check.*
 
-One limit worth stating: a producer runs on the reactor thread, so it must not
-block. A feed that has nothing to send yet should return an empty chunk, not
-sleep.
+A producer runs on the reactor thread, so it must not block — and therefore
+cannot sleep to pace itself. It sets `st.pauseMs` instead and the transport
+parks the coroutine for that long, **on the connection's socket**: a client that
+disconnects mid-pause makes the socket readable, the wait ends early, and a feed
+nobody is listening to stops at once rather than at its next tick.
+
+A producer that returns empty chunks with no pause is a busy loop. After
+`MaxEmptySpins` (1000) consecutive ones the transport ends that stream and
+counts it (`streamSpinAborts()`) rather than burning a core in silence.
+
+*Verified: `tests/reactor_stream_e2e.sh` measures all three — five events at
+300 ms take ~1.5 s (paced, not instant), a plain request served mid-pause takes
+~5 ms (the pause did not block the thread), and on a separate server with a 5 s
+feed the connection's fd goes 6 → 7 → 6 within one second of the client being
+killed (the disconnect, not the tick, ended it). The spin guard is exercised by
+a deliberately broken `/spin` route: cut off in ~16 ms, server unaffected.*
 
 ## Calling out: the async client
 
