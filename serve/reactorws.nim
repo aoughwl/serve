@@ -403,7 +403,8 @@ proc serveWsReactor*(port: int; handler: WsHandler; idleTimeoutMs = 0) =
     return
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopWs(r, listenFd)))
   r.run()
 
@@ -428,7 +429,8 @@ proc serveWssReactor*(port: int; ctx0: TlsContext; handler: WsHandler;
     return
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopWss(r, listenFd)))
   r.run()
 

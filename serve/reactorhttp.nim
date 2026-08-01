@@ -273,7 +273,8 @@ proc serveHttpReactor*(port: int; handler: ReactorHandler;
     return
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopHttp(r, listenFd)))
   r.run()
 
@@ -299,7 +300,8 @@ proc serveHttpsReactor*(port: int; ctx0: TlsContext; handler: ReactorHandler;
     return
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopHttps(r, listenFd)))
   r.run()
 

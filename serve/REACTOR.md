@@ -127,6 +127,25 @@ Defaults: 60 s for HTTP/1.1 and HTTP/2, **off** for WebSocket (a silent
 subscription is not a stalled one). All three take an `idleTimeoutMs` argument.
 *Verified: `tests/reactor_idle_timeout.sh`.*
 
+## Stopping
+
+`run()` used to loop until the process was killed, so the only way to end a
+server was to cut a response in half.
+
+`requestStop(r, graceful = true)` ends it properly. It sets two words and writes
+8 bytes to an eventfd the loop also watches — the only work a signal handler is
+allowed to do, and what lets a blocked `epoll_wait` be interrupted at all. A
+graceful stop closes the **listeners** (`registerListener` is how the reactor
+knows which fds those are), so nothing new is accepted while the connections
+already in flight run to completion; `run()` returns when the last one closes.
+A non-graceful stop returns at the next turn of the loop.
+
+The server entry points install SIGINT/SIGTERM handlers for a graceful stop, so
+Ctrl-C on a server drains rather than kills. *Verified:
+`tests/reactor_shutdown.sh` — a keep-alive connection held across the signal
+still gets a complete response, a new connection is refused, and the process
+exits on its own.*
+
 ## Async servers built on the reactor
 
 The reactor is the async backbone for real protocols, each one flat coroutine

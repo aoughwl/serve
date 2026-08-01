@@ -120,7 +120,8 @@ proc serveHttp2Reactor*(port: int; handler: H2Handler;
     return
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopH2(r, listenFd)))
   r.run()
 
@@ -189,7 +190,8 @@ proc serveTlsAlpn(port: int; ctx0: TlsContext; alpn: seq[string];
     return false
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
-  r.register(listenFd)
+  r.stopOnSignals()      # SIGINT/SIGTERM => graceful drain, not a killed response
+  r.registerListener(listenFd)
   r.spawn(delay(acceptLoopTlsAlpn(r, listenFd)))
   r.run()
   return true
