@@ -145,7 +145,14 @@ per connection, all multiplexed on one OS thread:
   `serveHttp2TlsReactor(port, cert, key, handler)` is the same server over TLS
   with ALPN `h2` — the path browsers actually take — with the handshake itself
   pumped on the reactor (see below), so a peer that stalls mid-handshake stalls
-  only itself.
+  only itself. **`serveHttpsAlpnReactor(port, cert, key, handler)`** is what a
+  real HTTPS port does: advertise `h2` *and* `http/1.1`, then serve each
+  connection with whichever the client chose, from one handler. A short
+  dispatcher coroutine owns the handshake (so the accept loop never suspends on
+  one peer's) and then `spawn`s the protocol body — spawned, not called, because
+  a coroutine that calls another suspending coroutine corrupts its frame.
+  *Verified: interleaved h2 and http/1.1 clients on one port, plus h2spec
+  146/146 against that same port* (`tests/reactor_alpn_e2e.sh`).
   *Verified: **h2spec 146/146 over both h2c and TLS** (`tests/h2spec.sh`) — was
   95/146 against the blocking server, which serves one connection at a time and
   so wedged on any connection left open — plus 20 concurrent requests with an

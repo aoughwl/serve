@@ -26,6 +26,8 @@ import tls
 import ./reactor
 import ./asyncio
 import ./asynctls
+import ./asyncconn
+import ./reactorhttp
 import ./http2
 import http/request
 import http/response
@@ -46,12 +48,18 @@ proc unsetH2Handler(req: Request): Response {.nimcall.} =
 var gH2Handler: H2Handler = unsetH2Handler
 var gIdleMs = IdleTimeoutMs
 
-proc handleH2Conn(r: Reactor; fd: cint) {.passive.} =
+proc handleH2Conn*(r: Reactor; c0: Conn) {.passive.} =
   ## Flat coroutine: drain queued frames → await more input → feed the session,
   ## until the session is idle (which includes "we just sent GOAWAY") or the
-  ## peer goes away.
+  ## peer goes away. Cleartext and TLS run this same body (asyncconn.nim); a
+  ## TLS `Conn` whose handshake is already done simply completes it instantly.
+  var c = c0
   var buf = default(array[ReadChunk, char])
-  let slot = h2OpenSession(gH2Handler)
+  var handshook = false
+  r.awaitConnHandshake(c, handshook)
+  var slot = -1
+  if handshook:
+    slot = h2OpenSession(gH2Handler)
   var alive = slot >= 0
   while alive:
     # --- drain everything nghttp2 has queued --------------------------------
@@ -66,7 +74,7 @@ proc handleH2Conn(r: Reactor; fd: cint) {.passive.} =
         pending = false
       else:
         var wrote = false
-        r.awaitWriteAll(fd, chunk, n, wrote)
+        r.awaitConnWriteAll(c, chunk, n, wrote)
         if not wrote:
           failed = true
     # --- then wait for more input -------------------------------------------
@@ -74,29 +82,16 @@ proc handleH2Conn(r: Reactor; fd: cint) {.passive.} =
       alive = false
     else:
       var got = 0
-      r.awaitRead(fd, addr buf[0], ReadChunk, got)
+      r.awaitConnRead(c, addr buf[0], ReadChunk, got)
       if got <= 0:
         alive = false
       elif not h2Feed(slot, addr buf[0], got):
         alive = false
   h2CloseSession(slot)
-  # Graceful close. `close()` on a socket whose receive queue still holds
-  # unread bytes makes the kernel send RST, and the peer's last frames — the
-  # PING it sent right after its GOAWAY, say — are exactly such bytes. So send
-  # FIN first and read the rest away until the peer closes too, bounded so a
-  # peer that keeps talking cannot pin the coroutine on its own data.
-  discard shutdownTcpWrite(fd)
-  var drained = 0
-  var draining = true
-  while draining and drained < MaxDrainBytes:
-    var got = 0
-    r.awaitRead(fd, addr buf[0], ReadChunk, got)
-    if got <= 0:
-      draining = false
-    else:
-      drained = drained + got
-  r.unregister(fd)
-  closeTcp(fd)
+  # Graceful close: close_notify (TLS), FIN, then read away whatever the peer
+  # had already sent. A bare close() with unread bytes queued — the PING it sent
+  # right after its GOAWAY, say — makes the kernel answer with RST instead.
+  r.closeConn(c, addr buf[0], ReadChunk, MaxDrainBytes)
 
 proc acceptLoopH2(r: Reactor; listenFd: cint) {.passive.} =
   var running = true
@@ -109,7 +104,7 @@ proc acceptLoopH2(r: Reactor; listenFd: cint) {.passive.} =
       discard setTcpNonBlocking(fd)
       r.register(fd)
       r.setIdleTimeout(fd, gIdleMs)
-      r.spawn(delay(handleH2Conn(r, fd)))
+      r.spawn(delay(handleH2Conn(r, plainConn(fd))))
 
 proc serveHttp2Reactor*(port: int; handler: H2Handler;
                         idleTimeoutMs = IdleTimeoutMs) =
@@ -130,71 +125,36 @@ proc serveHttp2Reactor*(port: int; handler: H2Handler;
   r.run()
 
 # ---------------------------------------------------------------------------
-# the same server over TLS (ALPN "h2") — the path a browser actually takes
+# over TLS, dispatching on ALPN — the path a browser actually takes
 # ---------------------------------------------------------------------------
 
 var gTlsCtx = TlsContext(handle: nil, mode: tlsClient, stateId: 0)
+var gAlpnH2Only = false
 
-proc handleH2TlsConn(r: Reactor; fd: cint) {.passive.} =
-  ## As `handleH2Conn`, but every I/O goes through the TLS layer, and the
-  ## handshake itself is pumped asynchronously — the connection is a coroutine
-  ## from its first byte, so a peer that stalls mid-handshake stalls only
-  ## itself. The body is spelled out rather than shared with the plaintext
-  ## version: the await primitives are templates (they must inline their own
-  ## suspend points), so there is no transport object to abstract over here.
-  var buf = default(array[ReadChunk, char])
-  var sock = Socket(handle: fd)
-  var tsock = wrapServer(gTlsCtx, sock)
+proc dispatchTlsConn(r: Reactor; fd: cint) {.passive.} =
+  ## Run the TLS handshake, then hand the connection to the coroutine for
+  ## whichever protocol ALPN settled on, and finish.
+  ##
+  ## The handshake happens HERE rather than in the accept loop: the accept loop
+  ## suspending on one peer's handshake would stop every other peer from being
+  ## accepted. And the protocol body is `spawn`ed rather than called, because a
+  ## coroutine that calls another suspending coroutine corrupts its frame (see
+  ## REACTOR.md) — spawning drives the new one to its first park and returns.
+  var c = tlsConn(gTlsCtx, fd)
   var ok = false
-  r.awaitTlsHandshake(tsock, fd, ok)
-  var slot = -1
-  if ok and negotiatedAlpn(tsock) == "h2":
-    slot = h2OpenSession(gH2Handler)
-  var alive = slot >= 0
-  while alive:
-    var failed = false
-    var pending = true
-    while pending and (not failed):
-      var chunk = cast[pointer](0)
-      var n = 0
-      if not h2NextOut(slot, chunk, n):
-        failed = true
-      elif n == 0:
-        pending = false
-      else:
-        var wrote = false
-        r.awaitTlsWriteAll(tsock, fd, chunk, n, wrote)
-        if not wrote:
-          failed = true
-    if failed or h2Idle(slot):
-      alive = false
-    else:
-      var got = 0
-      r.awaitTlsRead(tsock, fd, addr buf[0], ReadChunk, got)
-      if got <= 0:
-        alive = false
-      elif not h2Feed(slot, addr buf[0], got):
-        alive = false
-  h2CloseSession(slot)
-  # Same graceful close as the plaintext path, and for the same reason: closing
-  # while the peer's last bytes sit unread makes the kernel answer them with
-  # RST, which h2spec sees instead of the GOAWAY it was owed. close_notify
-  # first, then FIN, then read the rest away (ciphertext, discarded).
-  closeTls(tsock, false)
-  discard shutdownTcpWrite(fd)
-  var drained = 0
-  var draining = true
-  while draining and drained < MaxDrainBytes:
-    var got = 0
-    r.awaitRead(fd, addr buf[0], ReadChunk, got)
-    if got <= 0:
-      draining = false
-    else:
-      drained = drained + got
-  r.unregister(fd)
-  closeTcp(fd)
+  r.awaitConnHandshake(c, ok)
+  if not ok:
+    r.unregister(fd)
+    closeTls(c.tls)
+  elif negotiatedAlpn(c.tls) == "h2":
+    r.spawn(delay(handleH2Conn(r, c)))
+  elif gAlpnH2Only:
+    r.unregister(fd)
+    closeTls(c.tls)
+  else:
+    r.spawn(delay(handleHttpConn(r, c)))
 
-proc acceptLoopH2Tls(r: Reactor; listenFd: cint) {.passive.} =
+proc acceptLoopTlsAlpn(r: Reactor; listenFd: cint) {.passive.} =
   var running = true
   while running:
     var fd = InvalidTcpHandle
@@ -208,26 +168,49 @@ proc acceptLoopH2Tls(r: Reactor; listenFd: cint) {.passive.} =
       discard setTcpNonBlocking(fd)
       r.register(fd)
       r.setIdleTimeout(fd, gIdleMs)
-      r.spawn(delay(handleH2TlsConn(r, fd)))
+      r.spawn(delay(dispatchTlsConn(r, fd)))
 
-proc serveHttp2TlsReactor*(port: int; certFile: string; keyFile: string;
-                           handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
-  ## Serve HTTP/2 over TLS on `port`, advertising ALPN "h2", on the reactor.
-  ## This is the path browsers use (they do not speak h2c). A connection whose
-  ## ALPN does not settle on "h2" is closed — this entry point is h2-only.
-  ## Blocks, multiplexing every connection, handshakes included, on one thread.
-  gH2Handler = handler
+proc serveTlsAlpn(port: int; certFile: string; keyFile: string;
+                  alpn: seq[string]; idleTimeoutMs: int): bool =
+  ## Shared driver for the two TLS entry points below. Returns false if the
+  ## cert/key or the listener could not be brought up; otherwise it blocks.
   gIdleMs = idleTimeoutMs
   var ctx = newTlsServerContext(certFile, keyFile)
   if not ctx.isValid:
-    return
-  discard ctx.setAlpnServer(@["h2"])
+    return false
+  discard ctx.setAlpnServer(alpn)
   gTlsCtx = ctx
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
-    return
+    return false
   discard setTcpNonBlocking(listenFd)
   let r = newReactor()
   r.register(listenFd)
-  r.spawn(delay(acceptLoopH2Tls(r, listenFd)))
+  r.spawn(delay(acceptLoopTlsAlpn(r, listenFd)))
   r.run()
+  return true
+
+proc serveHttp2TlsReactor*(port: int; certFile: string; keyFile: string;
+                           handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
+  ## Serve HTTP/2 over TLS on `port`, advertising ALPN "h2" only, on the
+  ## reactor. A connection whose ALPN does not settle on "h2" is closed — this
+  ## entry point is h2-only; use `serveHttpsAlpnReactor` to serve both. Blocks,
+  ## multiplexing every connection, handshakes included, on one thread.
+  gH2Handler = handler
+  gAlpnH2Only = true
+  discard serveTlsAlpn(port, certFile, keyFile, @["h2"], idleTimeoutMs)
+
+proc serveHttpsAlpnReactor*(port: int; certFile: string; keyFile: string;
+                            handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
+  ## What a real HTTPS port does: advertise both `h2` and `http/1.1`, then serve
+  ## each connection with whichever the client chose — HTTP/2 for a modern
+  ## browser or curl, HTTP/1.1 for anything older — from the same handler, on
+  ## the one thread.
+  ##
+  ## `H2Handler` and `ReactorHandler` are the same shape
+  ## (`proc(req: Request): Response {.nimcall.}`), so one handler covers both
+  ## protocols; the HTTP/1.1 side is `reactorhttp`'s connection body.
+  gH2Handler = handler
+  gAlpnH2Only = false
+  setReactorHttpHandler(handler, idleTimeoutMs)
+  discard serveTlsAlpn(port, certFile, keyFile, @["h2", "http/1.1"], idleTimeoutMs)

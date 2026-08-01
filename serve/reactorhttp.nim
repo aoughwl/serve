@@ -139,7 +139,14 @@ proc chunkedComplete(s: string; start: int): bool =
 # the per-connection coroutine
 # ---------------------------------------------------------------------------
 
-proc handleHttpConn(r: Reactor; c0: Conn) {.passive.} =
+proc setReactorHttpHandler*(handler: ReactorHandler; idleTimeoutMs = IdleTimeoutMs) =
+  ## Install the HTTP/1.1 handler without starting a server. This exists for
+  ## `reactorh2`'s ALPN dispatcher, which serves HTTP/1.1 connections from a
+  ## listener it owns.
+  gHandler = handler
+  gIdleMs = idleTimeoutMs
+
+proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
   ## Flat coroutine: keep-alive loop of read-request → handle → write-response.
   ## All loop exits are via flags (never break/return beside a suspend).
   ## Cleartext and TLS run the same body — see asyncconn.nim.
