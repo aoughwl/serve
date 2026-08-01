@@ -22,12 +22,20 @@ import tls
 import ./reactor
 import ./asyncio
 import ./asyncconn
+import ./stream
 import http/request
 import http/response
 import http/headers
 
 type
   ReactorHandler* = proc(req: Request): Response {.nimcall.}
+
+  ReactorStreamHandler* = proc(req: Request): StreamResponse {.nimcall.}
+    ## A handler whose body is produced incrementally (see serve/stream.nim).
+    ## Installed alongside the ordinary handler: `wantsStream` decides which one
+    ## answers a given request, so streaming is per-route, not per-server.
+
+  StreamPredicate* = proc(req: Request): bool {.nimcall.}
 
 const
   MaxRequestBytes* = 8 * 1024 * 1024   ## default whole-request cap -> 413
@@ -40,6 +48,25 @@ var gHandler: nil ReactorHandler = nil
 var gIdleMs = IdleTimeoutMs
 var gMaxRequestBytes = MaxRequestBytes
 var gMaxKeepAlive = MaxKeepAlive
+
+proc noStream(req: Request): StreamResponse {.nimcall.} =
+  emptyStream(204)
+
+proc neverStream(req: Request): bool {.nimcall.} =
+  false
+
+# Non-nilable by construction: a coroutine cannot carry a nil check across its
+# suspend points, so the slots hold stubs rather than nil.
+var gStreamHandler: ReactorStreamHandler = noStream
+var gWantsStream: StreamPredicate = neverStream
+
+proc setReactorStreamHandler*(handler: ReactorStreamHandler;
+                              wants: StreamPredicate) =
+  ## Install a streaming handler and the predicate that decides which requests
+  ## it answers. Everything else keeps going to the ordinary handler, so a
+  ## server can stream `/events` and serve the rest normally.
+  gStreamHandler = handler
+  gWantsStream = wants
 
 proc setReactorLimits*(maxRequestBytes = MaxRequestBytes; maxKeepAlive = MaxKeepAlive) =
   ## Resource bounds for subsequently accepted connections. Both were `const`,
@@ -217,32 +244,96 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
         let body = decodeChunked(subStr(raw, headerEnd, raw.len))
         raw = header & body
       let req = parseRequest(raw)
-      var resp = gHandler(req)
-      let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
-      if not hasHeader(resp.headers, "Connection"):
-        if ka:
-          resp.withHeader("Connection", "keep-alive")
+      var streamed = false
+      # --- streamed response --------------------------------------------------
+      # The producer is PULLED here rather than handed a writer: a handler is a
+      # plain proc and cannot suspend, so it cannot write. It can only be asked
+      # for the next piece while this coroutine — which can suspend — writes it.
+      if gWantsStream(req):
+        streamed = true
+        var sr = gStreamHandler(req)
+        var streamOk = false
+        let head = streamHeaderBlock(sr, req.version)
+        var hbuf = newSeq[char](head.len)
+        var hi2 = 0
+        while hi2 < head.len:
+          hbuf[hi2] = head[hi2]
+          inc hi2
+        r.awaitConnWriteAll(c, addr hbuf[0], hbuf.len, streamOk)
+        let chunkedOut = req.version == "HTTP/1.1"
+        let wantBody = not isMethod(req, "HEAD")
+        var producing = streamOk and wantBody
+        while producing:
+          var piece = ""
+          if not sr.producer(sr.state, piece):
+            producing = false
+          elif piece.len > 0:
+            var framed = ""
+            if chunkedOut:
+              framed.add chunkHeader(piece.len)
+              framed.add piece
+              framed.add "\r\n"
+            else:
+              framed = piece
+            var pbuf = newSeq[char](framed.len)
+            var pi = 0
+            while pi < framed.len:
+              pbuf[pi] = framed[pi]
+              inc pi
+            var pok = false
+            r.awaitConnWriteAll(c, addr pbuf[0], pbuf.len, pok)
+            if not pok:
+              # The client went away mid-stream. That is the NORMAL end of an
+              # event stream, not an error — stop producing and close.
+              producing = false
+              streamOk = false
+        if streamOk and chunkedOut and wantBody:
+          var term = newSeq[char](5)
+          let t = "0\r\n\r\n"
+          var ti = 0
+          while ti < t.len:
+            term[ti] = t[ti]
+            inc ti
+          var tok = false
+          r.awaitConnWriteAll(c, addr term[0], term.len, tok)
+          streamOk = tok
+        # A streamed response ends the connection unless it was chunked: only
+        # chunked framing tells the client where the body stopped.
+        if streamOk and chunkedOut:
+          inc count
         else:
-          resp.withHeader("Connection", "close")
-      let includeBody = not isMethod(req, "HEAD")
-      let outStr = responseToString(resp, includeBody)
-      # copy to an addressable seq (nimony string indexing is not addressable)
-      var outBuf = newSeq[char](outStr.len)
-      var w = 0
-      while w < outStr.len:
-        outBuf[w] = outStr[w]
-        inc w
-      var wrote = false
-      if outBuf.len == 0:
-        wrote = true
-      else:
-        r.awaitConnWriteAll(c, addr outBuf[0], outBuf.len, wrote)
-      if not wrote:
-        alive = false
-      else:
-        inc count
-        if not ka:
           alive = false
+      # `continue` is deliberately NOT used to skip the ordinary path: a
+      # loop-control jump sharing a branch with a `suspend` is the shape the
+      # coroutine transform mishandles (see REACTOR.md), so the exit rides on a
+      # flag like every other exit in this file.
+      if not streamed:
+       var resp = gHandler(req)
+       let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
+       if not hasHeader(resp.headers, "Connection"):
+         if ka:
+           resp.withHeader("Connection", "keep-alive")
+         else:
+           resp.withHeader("Connection", "close")
+       let includeBody = not isMethod(req, "HEAD")
+       let outStr = responseToString(resp, includeBody)
+       # copy to an addressable seq (nimony string indexing is not addressable)
+       var outBuf = newSeq[char](outStr.len)
+       var w = 0
+       while w < outStr.len:
+         outBuf[w] = outStr[w]
+         inc w
+       var wrote = false
+       if outBuf.len == 0:
+         wrote = true
+       else:
+         r.awaitConnWriteAll(c, addr outBuf[0], outBuf.len, wrote)
+       if not wrote:
+         alive = false
+       else:
+         inc count
+         if not ka:
+           alive = false
   r.closeConn(c, addr buf[0], ReadChunk, MaxDrainBytes)
 
 proc acceptLoopHttp(r: Reactor; listenFd: cint) {.passive.} =

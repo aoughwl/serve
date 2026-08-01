@@ -127,6 +127,45 @@ Defaults: 60 s for HTTP/1.1 and HTTP/2, **off** for WebSocket (a silent
 subscription is not a stalled one). All three take an `idleTimeoutMs` argument.
 *Verified: `tests/reactor_idle_timeout.sh`.*
 
+## Streaming a response
+
+Every response path materialised the whole body first, which rules out three
+things a server has to do: server-sent events (a body that is never finished),
+downloads larger than memory, and any response whose first byte should reach the
+client before the last is computed.
+
+`serve/stream.nim` adds a **pull producer**:
+
+```nim
+proc next(st: var StreamState; chunk: var string): bool {.nimcall.}
+```
+
+called repeatedly by the connection coroutine until it returns false. Pull, not
+push, because a handler cannot suspend and therefore cannot write — it can only
+be asked for the next piece while the coroutine does the suspending write.
+(nghttp2's data provider works the same way, which is a good sign it is the
+right seam.) Returning `true` with an empty chunk means "nothing right now" and
+is not treated as the end.
+
+`setReactorStreamHandler(handler, wants)` installs it beside the ordinary
+handler, with a predicate deciding which requests stream — so a server can
+stream `/events` and serve everything else normally. Framing is added by the
+transport: `Transfer-Encoding: chunked` for HTTP/1.1, and for anything older no
+chunked framing at all plus `Connection: close`, since silently sending chunks
+to an HTTP/1.0 client would corrupt the body. Built in: `fileStream` (with
+offset/length, so it can back a byte range) and `sseEvent`/`sseStream`, which
+also sets the `Cache-Control: no-cache` and `X-Accel-Buffering: no` an
+EventSource needs to not be buffered into uselessness by an intermediary.
+
+*Verified: `tests/reactor_stream_e2e.sh` — a 128 MiB file arrives byte-exact
+while the server's PEAK RSS stays at ~7 MB. Materialising the body would put the
+whole file in that number, so the memory figure is the assertion; the checksum
+is only the sanity check.*
+
+One limit worth stating: a producer runs on the reactor thread, so it must not
+block. A feed that has nothing to send yet should return an empty chunk, not
+sleep.
+
 ## Calling out: the async client
 
 The stack could *serve* asynchronously and could only *call* synchronously —
