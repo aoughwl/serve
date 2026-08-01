@@ -522,7 +522,10 @@ proc staticRoute*(root: string; req: Request): Response =
     return r
   if not (isMethod(req, "GET") or isMethod(req, "HEAD")):
     return response(405, "text/plain", "Method Not Allowed\n")
-  return staticResponseObj(root, req.path)
+  # Request-aware: conditional requests (304) and byte ranges (206) come from
+  # the REQUEST, so a static server that ignored it re-sent every unchanged
+  # asset in full, every time.
+  return staticResponseFor(root, req)
 
 proc staticHandler*(root: string): Handler =
   ## Build a handler that serves static files under `root`. This is how the
