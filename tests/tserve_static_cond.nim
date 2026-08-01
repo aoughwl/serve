@@ -64,6 +64,21 @@ proc main =
   check(etag.len > 2 and etag[0] == '"', "an ETag was issued: " & etag)
   let lastMod = headerValue(full.headers, "Last-Modified")
   check(lastMod.len > 0, "a Last-Modified was issued")
+  # "a header exists" is a PROXY; the property is that the date is real. The
+  # first version of this test asserted only the former and let a
+  # nanoseconds-as-seconds bug through — `Mon, 02 Jun 56583934092 19:58:27 GMT`
+  # went out to every client.
+  check(lastMod.len == 29, "Last-Modified is a fixed-width IMF-fixdate: " & lastMod)
+  var year = 0
+  var yi = 12                       # "Www, DD Mon " is 12 chars
+  while yi < lastMod.len and lastMod[yi] >= '0' and lastMod[yi] <= '9':
+    year = year * 10 + (ord(lastMod[yi]) - ord('0'))
+    inc yi
+  check(year >= 2020 and year <= 2100,
+        "Last-Modified names a plausible year, not a unit-confusion artefact: " & lastMod)
+  check(epochSeconds(1785616429958539107'i64) == 1785616429'i64, "nanoseconds normalise")
+  check(epochSeconds(1785616429958'i64) == 1785616429'i64, "milliseconds normalise")
+  check(epochSeconds(1785616429'i64) == 1785616429'i64, "seconds pass through")
   check(headerValue(full.headers, "Accept-Ranges") == "bytes", "Accept-Ranges advertised")
 
   let notMod = staticResponseFor(Root, req("/f.txt", "If-None-Match", etag))

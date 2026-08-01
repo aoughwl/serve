@@ -20,6 +20,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
 
 import std/syncio
+import std/os        # getFileSize, so a file stream can declare its length
 import http/headers
 import http/response
 
@@ -44,12 +45,21 @@ type
 
   StreamResponse* = object
     ## A response the server writes incrementally. `headers` are sent as given;
-    ## the transport adds the framing (`Transfer-Encoding: chunked`).
+    ## the transport adds the framing.
+    ##
+    ## `contentLength` is the difference between the two kinds of stream. -1
+    ## means "unknown" — the transport chunks it, which is the only honest
+    ## framing for a feed that has no end. A value >= 0 means the size is known
+    ## up front (a file, a byte range): the transport then sends
+    ## `Content-Length` and writes the pieces raw, so the client gets a progress
+    ## bar and a `HEAD` gets a truthful answer. Chunking a file just because the
+    ## body happens to arrive in pieces throws that away for nothing.
     status*: int
     contentType*: string
     headers*: seq[Header]
     producer*: ChunkProducer
     state*: StreamState
+    contentLength*: int64
 
 proc emptyState*(): StreamState =
   StreamState(file: default(File), hasFile: false, remaining: -1'i64,
@@ -63,7 +73,7 @@ proc emptyStream*(status = 204): StreamResponse =
   ## A stream that ends immediately — the "nothing to say" case, and the value a
   ## handler global is initialised with so it is never nil.
   StreamResponse(status: status, contentType: "text/plain", headers: @[],
-                 producer: noBody, state: emptyState())
+                 producer: noBody, state: emptyState(), contentLength: 0'i64)
 
 # ---------------------------------------------------------------------------
 # built-in producers
@@ -113,11 +123,23 @@ proc fileStream*(path: string; contentType: string; status = 200;
       f.setFilePos(offset)
     except:
       discard
+  # A file's length is knowable, so know it: `length < 0` means "the rest of
+  # the file", not "unknown". Sending a file chunked because the bytes happen to
+  # arrive in pieces would cost the client its progress bar for nothing.
+  var declared = length
+  if declared < 0'i64:
+    try:
+      let total = getFileSize(path)
+      declared = total - offset
+      if declared < 0'i64: declared = 0'i64
+    except:
+      declared = -1'i64          # genuinely unknown: fall back to chunked
   result = StreamResponse(status: status, contentType: contentType,
                           headers: @[], producer: fileProducer,
                           state: StreamState(file: f, hasFile: true,
                                              remaining: length, counter: 0,
-                                             limit: 0, text: ""))
+                                             limit: 0, text: ""),
+                          contentLength: declared)
 
 proc sseEvent*(data: string; event = ""; id = ""): string =
   ## One server-sent event, framed per the EventSource wire format: optional
@@ -146,7 +168,8 @@ proc sseStream*(producer: ChunkProducer; state: StreamState): StreamResponse =
   ## which an intermediary can hold events until the connection ends and undo
   ## the whole point.
   result = StreamResponse(status: 200, contentType: "text/event-stream",
-                          headers: @[], producer: producer, state: state)
+                          headers: @[], producer: producer, state: state,
+                          contentLength: -1'i64)   # a feed has no length
   result.headers.add Header(name: "Cache-Control", value: "no-cache")
   result.headers.add Header(name: "X-Accel-Buffering", value: "no")
 
@@ -174,11 +197,19 @@ proc chunkHeader*(n: int): string =
     dec i
   result.add "\r\n"
 
+proc chunksFramed*(r: StreamResponse; version: string): bool =
+  ## Whether the transport must wrap each piece in chunk framing: only when the
+  ## length is unknown AND the client speaks HTTP/1.1.
+  r.contentLength < 0'i64 and version == "HTTP/1.1"
+
 proc streamHeaderBlock*(r: StreamResponse; version: string): string =
-  ## The status line and headers for a streamed response. `Transfer-Encoding:
-  ## chunked` is added for HTTP/1.1; for anything older there is no chunked
-  ## framing, so the body is delimited by the close and `Connection: close` says
-  ## so — silently sending chunks to an HTTP/1.0 client would corrupt the body.
+  ## The status line and headers for a streamed response.
+  ##
+  ## Known length: `Content-Length`, pieces written raw, connection reusable.
+  ## Unknown length on HTTP/1.1: `Transfer-Encoding: chunked`. Unknown length on
+  ## an older client: neither — the body is delimited by the close, and
+  ## `Connection: close` says so, because silently sending chunks to an
+  ## HTTP/1.0 client would corrupt the body.
   result = "HTTP/1.1 "
   result.add $r.status
   let phrase = reasonPhrase(r.status)
@@ -189,7 +220,25 @@ proc streamHeaderBlock*(r: StreamResponse; version: string): string =
     result.add "Content-Type: " & r.contentType & "\r\n"
   for h in r.headers:
     result.add h.name & ": " & h.value & "\r\n"
-  if version == "HTTP/1.1":
+  if r.contentLength >= 0'i64:
+    result.add "Content-Length: "
+    var n = r.contentLength
+    var digits = default(array[24, char])
+    var c = 0
+    if n == 0'i64:
+      digits[0] = '0'
+      c = 1
+    while n > 0'i64:
+      digits[c] = char(ord('0') + int(n mod 10'i64))
+      n = n div 10'i64
+      inc c
+    var i = c - 1
+    while i >= 0:
+      result.add digits[i]
+      dec i
+    result.add "\r\n"
+    result.add "Connection: keep-alive\r\n"
+  elif version == "HTTP/1.1":
     result.add "Transfer-Encoding: chunked\r\n"
     result.add "Connection: keep-alive\r\n"
   else:

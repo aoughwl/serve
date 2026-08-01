@@ -52,6 +52,26 @@ HWM="$(grep VmHWM /proc/$SRV/status | awk '{print $2}')"
 echo "server peak RSS after streaming ${SIZE_MB}MiB: ${HWM} kB (limit ${RSS_LIMIT_KB} kB)"
 (( HWM < RSS_LIMIT_KB )) || fail "peak RSS ${HWM} kB means the body was materialised, not streamed"
 
+# --- the same file through the streaming STATIC path -------------------------
+# Ranges, validators and Content-Type come from the request, and the body still
+# never lands in memory.
+RHEAD="$(curl -s --max-time 60 -r 100-109 -D- -o "$NC/part.bin" "http://127.0.0.1:$PORT/static")"
+echo "$RHEAD" | grep -q '^HTTP/1.1 206' || fail "streamed static did not answer 206"
+echo "$RHEAD" | grep -qi "content-range: bytes 100-109/" || fail "wrong Content-Range: $RHEAD"
+[[ "$(wc -c < "$NC/part.bin")" == "10" ]] || fail "range returned $(wc -c < "$NC/part.bin") bytes, wanted 10"
+cmp -s <(dd if="$NC/big.bin" bs=1 skip=100 count=10 status=none) "$NC/part.bin" \
+  || fail "the ranged bytes are not the right bytes"
+
+LM="$(curl -sI --max-time 60 "http://127.0.0.1:$PORT/static" | grep -i '^last-modified:' | sed 's/^[^:]*: //' | tr -d '\r')"
+REAL="$(date -r "$NC/big.bin" -u '+%a, %d %b %Y %H:%M:%S GMT')"
+[[ "$LM" == "$REAL" ]] || fail "Last-Modified '$LM' does not match the file's mtime '$REAL'"
+echo "streamed static: 206 with the right bytes, Last-Modified matches the file"
+
+ETAG="$(curl -sI --max-time 60 "http://127.0.0.1:$PORT/static" | grep -i '^etag:' | sed 's/^[^:]*: //' | tr -d '\r')"
+CODE="$(curl -s --max-time 60 -o /dev/null -w '%{http_code}' -H "If-None-Match: $ETAG" "http://127.0.0.1:$PORT/static")"
+[[ "$CODE" == "304" ]] || fail "conditional request got $CODE, wanted 304"
+echo "streamed static: a matching ETag is a 304"
+
 # --- ordinary responses still work on the same server ------------------------
 BODY="$(curl -s --max-time 10 "http://127.0.0.1:$PORT/hello")"
 [[ "$BODY" == "hello, not streamed" ]] || fail "non-streamed route broke: $BODY"

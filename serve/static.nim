@@ -15,11 +15,13 @@ import http/url
 import http/headers
 import http/request
 import http/response
+import ./stream
 
 const MaxStaticFileBytes* = 64 * 1024 * 1024
-  ## Default cap on a file this module will serve. The body is read whole into
-  ## memory (there is no streaming file path yet), so an uncapped root meant any
-  ## file dropped in it could exhaust the process.
+  ## Default cap for the IN-MEMORY path (`staticResponseFor`), which reads the
+  ## body whole — an uncapped root there means any file dropped in it can
+  ## exhaust the process. `staticStreamFor` produces the body from disk instead
+  ## and needs no cap at all; prefer it wherever the transport can stream.
 
 var gMaxStaticBytes = MaxStaticFileBytes
 var gStaticTooLarge = 0
@@ -165,6 +167,19 @@ proc httpDate*(epoch: int64): string =
   result.add ':'
   pad2(result, second)
   result.add " GMT"
+
+proc epochSeconds*(fileTime: int64): int64 =
+  ## Normalise whatever `getLastModificationTime` hands back into SECONDS.
+  ##
+  ## It currently returns NANOSECONDS, which fed straight into a date formatter
+  ## produced `Mon, 02 Jun 56583934092 19:58:27 GMT` — a `Last-Modified` no cache
+  ## can use and none would report. The magnitude is unambiguous (no plausible
+  ## second-count reaches 1e11 until the year 5138), so rather than hardcode one
+  ## unit and break on the next stdlib change, classify it.
+  if fileTime > 100_000_000_000_000_000'i64: return fileTime div 1_000_000_000'i64
+  if fileTime > 100_000_000_000_000'i64: return fileTime div 1_000_000'i64
+  if fileTime > 100_000_000_000'i64: return fileTime div 1_000'i64
+  fileTime
 
 proc etagFor*(size: int64; mtime: int64): string =
   ## `"<size>-<mtime>"`. Size and mtime together change on any edit that matters
@@ -342,7 +357,7 @@ proc staticResponseFor*(root: string; req: Request): Response =
   if not statOk:
     return response(404, "text/plain", "Not Found\n")
   let etag = etagFor(size, mtime)
-  let lastMod = httpDate(mtime)
+  let lastMod = httpDate(epochSeconds(mtime))
 
   # --- conditional: nothing to send -----------------------------------------
   if etagMatches(headerValue(req.headers, "If-None-Match"), etag) or
@@ -405,3 +420,76 @@ proc staticResponse*(root: string; urlPath: string; includeBody = true): string 
 proc serveFile*(root: string; urlPath: string): string =
   ## Backwards-compatible static GET helper.
   staticResponse(root, urlPath, true)
+
+# ---------------------------------------------------------------------------
+# the streaming form
+# ---------------------------------------------------------------------------
+
+proc staticStreamFor*(root: string; req: Request): StreamResponse =
+  ## Static serving that never holds the file: same routing, same validators and
+  ## the same range handling as `staticResponseFor`, but the body is produced
+  ## from disk in pieces. This is the form with no size cap — the cap on the
+  ## in-memory path exists only because that path has to hold the whole file.
+  ##
+  ## A 304, a 403, a 404 and a 416 all come back as streams with no body, so a
+  ## caller has exactly one thing to write back.
+  var full = ""
+  let routed = resolveStaticPath(root, req.path, full)
+  if routed == 403:
+    result = emptyStream(403)
+    return result
+  if routed == 404:
+    result = emptyStream(404)
+    return result
+
+  var size = 0'i64
+  var mtime = 0'i64
+  var statOk = true
+  try:
+    size = getFileSize(full)
+    mtime = getLastModificationTime(full)
+  except:
+    statOk = false
+  if not statOk:
+    result = emptyStream(404)
+    return result
+
+  let etag = etagFor(size, mtime)
+  let lastMod = httpDate(epochSeconds(mtime))
+
+  if etagMatches(headerValue(req.headers, "If-None-Match"), etag) or
+     (headerValue(req.headers, "If-Modified-Since") == lastMod and lastMod.len > 0):
+    result = emptyStream(304)
+    result.contentType = contentTypeFor(full)
+    result.headers.add Header(name: "ETag", value: etag)
+    result.headers.add Header(name: "Last-Modified", value: lastMod)
+    result.headers.add Header(name: "Cache-Control", value: "no-cache")
+    return result
+
+  var a = 0'i64
+  var b = size - 1'i64
+  let verdict = parseByteRange(headerValue(req.headers, "Range"), size, a, b)
+  if verdict < 0:
+    result = emptyStream(416)
+    var cr = "bytes */"
+    appendUInt(cr, size)
+    result.headers.add Header(name: "Content-Range", value: cr)
+    result.headers.add Header(name: "ETag", value: etag)
+    return result
+
+  if verdict > 0:
+    result = fileStream(full, contentTypeFor(full), 206, a, b - a + 1'i64)
+    var cr = "bytes "
+    appendUInt(cr, a)
+    cr.add '-'
+    appendUInt(cr, b)
+    cr.add '/'
+    appendUInt(cr, size)
+    result.headers.add Header(name: "Content-Range", value: cr)
+  else:
+    result = fileStream(full, contentTypeFor(full), 200)
+
+  result.headers.add Header(name: "ETag", value: etag)
+  result.headers.add Header(name: "Last-Modified", value: lastMod)
+  result.headers.add Header(name: "Accept-Ranges", value: "bytes")
+  result.headers.add Header(name: "X-Content-Type-Options", value: "nosniff")

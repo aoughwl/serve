@@ -260,7 +260,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
           hbuf[hi2] = head[hi2]
           inc hi2
         r.awaitConnWriteAll(c, addr hbuf[0], hbuf.len, streamOk)
-        let chunkedOut = req.version == "HTTP/1.1"
+        let chunkedOut = chunksFramed(sr, req.version)
         let wantBody = not isMethod(req, "HEAD")
         var producing = streamOk and wantBody
         while producing:
@@ -297,9 +297,9 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
           var tok = false
           r.awaitConnWriteAll(c, addr term[0], term.len, tok)
           streamOk = tok
-        # A streamed response ends the connection unless it was chunked: only
-        # chunked framing tells the client where the body stopped.
-        if streamOk and chunkedOut:
+        # The connection survives only when the client can tell where the body
+        # stopped — chunk framing, or a declared Content-Length.
+        if streamOk and (chunkedOut or sr.contentLength >= 0'i64):
           inc count
         else:
           alive = false
