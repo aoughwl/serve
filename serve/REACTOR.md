@@ -146,9 +146,15 @@ and belong above this. **DNS resolution blocks**: `getaddrinfo` has no
 non-blocking form worth the name, so a hostname costs the reactor thread the
 lookup and an IP literal costs nothing.
 
+Every step is bounded by `timeoutMs` (default 30 s), armed **before** the
+connect rather than after it — a host that drops the SYN never makes the socket
+writable, so the connect is the step most able to park a coroutine forever.
+
 *Verified: `tests/reactor_proxy_e2e.sh` — 12 concurrent requests proxied
 through a deliberately 0.5s upstream finish in ~0.5s, not the ~6s a blocking
-fetch would take. The number IS the assertion.*
+fetch would take (the number IS the assertion); and an upstream that accepts
+then says nothing is answered 502 after the configured 1s, with the proxy still
+serving afterwards.*
 
 ## Timers that resume, not just timers that kill
 

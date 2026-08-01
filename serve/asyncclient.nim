@@ -62,15 +62,20 @@ proc buildRequest*(meth, path, host, body: string): string =
   result.add body
 
 template awaitConnect*(r: Reactor; ip: uint32; port: int; fdOut: var cint;
-                       okOut: var bool) =
+                       okOut: var bool; timeoutMs = 30_000) =
   ## Start a non-blocking connect and suspend until it resolves. `fdOut` is the
   ## registered socket on success; the caller owns it either way.
+  ##
+  ## The timeout is armed BEFORE the wait, not after it: a host that drops the
+  ## SYN never makes the socket writable at all, so a connect is exactly the
+  ## step most able to park a coroutine forever.
   okOut = false
   fdOut = InvalidTcpHandle
   let res = connectTcp4NonBlocking(uint32(ip), port)
   if isValidTcp(res.handle):
     fdOut = res.handle
     r.register(fdOut)
+    r.setIdleTimeout(fdOut, timeoutMs)
     if res.status == tcpConnectConnected:
       okOut = true
     else:
@@ -83,20 +88,27 @@ template awaitConnect*(r: Reactor; ip: uint32; port: int; fdOut: var cint;
 
 template awaitFetch*(r: Reactor; hostOrIp: string; port: int; useTls: bool;
                      meth, path, body: string; resp: var Response;
-                     okOut: var bool) =
+                     okOut: var bool; timeoutMs = 30_000) =
   ## One HTTP/1.1 request from inside a coroutine: connect, optionally TLS
   ## handshake, write, read to EOF or Content-Length, parse. `okOut` is false if
   ## any step failed; `resp.status` is 0 on a response that never parsed.
   ##
   ## Everything here suspends — the calling coroutine yields the thread at every
   ## step, so a server can call out while continuing to serve everyone else.
+  ##
+  ## `timeoutMs` bounds every step of the exchange, not the exchange as a whole:
+  ## it is the reactor's idle timeout on this socket, so an upstream that
+  ## accepts and then says nothing — or goes away mid-body — costs that long and
+  ## no more. Without it a black-hole upstream parks the calling coroutine for
+  ## the life of the process, which is the failure mode that makes servers
+  ## mysteriously stop responding. 0 disables it.
   okOut = false
   resp = Response(status: 0, contentType: "", headers: @[], body: "")
   var ip = 0'u32
   if resolveTcp4(hostOrIp, ip):        # blocking; see the module doc
     var cfd = InvalidTcpHandle
     var connected = false
-    r.awaitConnect(ip, port, cfd, connected)
+    r.awaitConnect(ip, port, cfd, connected, timeoutMs)
     if isValidTcp(cfd):
       var c = plainConn(cfd)
       if connected and useTls:

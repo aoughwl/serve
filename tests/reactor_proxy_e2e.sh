@@ -95,4 +95,41 @@ if elapsed > 2.5:
           "(serial would be ~%.1fs, overlapped ~0.5s)" % (elapsed, N * 0.5))
     sys.exit(1)
 PY
+
+# --- and the other half: an upstream that ACCEPTS and then says nothing ------
+# Without a bound on the outbound call this parks the proxy's coroutine for the
+# life of the process, which is how a server mysteriously stops responding.
+kill $UP 2>/dev/null || true
+kill $SRV 2>/dev/null || true
+sleep 0.3
+
+python3 - "$UPPORT" >/dev/null 2>&1 <<'PY' &
+import socket, sys, time
+PORT = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT)); srv.listen(64)
+held = []
+while True:
+    c, _ = srv.accept()
+    held.append(c)          # accept, read nothing, answer nothing, never close
+    time.sleep(0.01)
+PY
+UP=$!
+sleep 0.5
+"$BIN" "$PORT" 127.0.0.1 "$UPPORT" 1000 >/dev/null 2>&1 &
+SRV=$!
+sleep 0.5
+
+START="$(date +%s%N)"
+BODY="$(curl -s --max-time 10 "http://127.0.0.1:$PORT/blackhole" || true)"
+ELAPSED_MS=$(( ( $(date +%s%N) - START ) / 1000000 ))
+echo "black-hole upstream answered in ${ELAPSED_MS}ms: ${BODY%%$'\n'*}"
+[[ "$BODY" == *"upstream unreachable"* ]] || { echo "FAIL: expected a 502 body, got: $BODY"; exit 1; }
+(( ELAPSED_MS < 5000 )) || { echo "FAIL: the 1s upstream timeout did not bound the call"; exit 1; }
+
+# and the proxy is still healthy afterwards
+BODY2="$(curl -s --max-time 10 "http://127.0.0.1:$PORT/again" || true)"
+[[ "$BODY2" == *"upstream unreachable"* ]] || { echo "FAIL: proxy stopped serving after a timeout: $BODY2"; exit 1; }
+echo "proxy still serving after the timeout"
 echo "PASS"

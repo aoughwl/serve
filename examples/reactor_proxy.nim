@@ -4,7 +4,7 @@
 ## with the outbound call suspending like any other I/O: while one connection
 ## waits on the upstream, the same thread keeps serving everyone else.
 ##
-##   bin/reactor_proxy 8160 127.0.0.1 8161 &      # listen 8160, upstream 8161
+##   bin/reactor_proxy 8160 127.0.0.1 8161 [upstream-timeout-ms] &
 ##   curl http://127.0.0.1:8160/hello
 ##
 ## The handler is a `{.nimcall.}` function pointer, which cannot capture — and
@@ -25,6 +25,7 @@ const ReadChunk = 4096
 
 var gUpHost = "127.0.0.1"
 var gUpPort = 8161
+var gUpTimeoutMs = 30_000   ## bounds the outbound call; 4th argument overrides
 
 proc proxyConn(r: Reactor; c0: Conn) {.passive.} =
   var c = c0
@@ -51,7 +52,8 @@ proc proxyConn(r: Reactor; c0: Conn) {.passive.} =
     let req = parseRequest(raw)
     var up = Response(status: 0, contentType: "", headers: @[], body: "")
     var ok = false
-    r.awaitFetch(gUpHost, gUpPort, false, req.meth, req.path, req.body, up, ok)
+    r.awaitFetch(gUpHost, gUpPort, false, req.meth, req.path, req.body, up, ok,
+                 gUpTimeoutMs)
     if not ok:
       up = response(502, "text/plain", "upstream unreachable\n")
     let outStr = responseToString(up, true)
@@ -88,6 +90,9 @@ if paramCount() >= 2:
 if paramCount() >= 3:
   try: gUpPort = parseInt(paramStr(3))
   except: gUpPort = 8161
+if paramCount() >= 4:
+  try: gUpTimeoutMs = parseInt(paramStr(4))
+  except: gUpTimeoutMs = 30_000
 
 let listenFd = listenTcp(port)
 if isValidTcp(listenFd):
