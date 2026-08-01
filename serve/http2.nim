@@ -249,6 +249,17 @@ proc appendInt(s: var string; v: int) =
     s.add digits[i]
     dec i
 
+const MaxH2ResponseHeaders* = 128
+  ## Response header slots per stream, `:status` included. Past this the
+  ## response is refused rather than trimmed — see `submitResponseFor`.
+
+var gH2HeaderOverflows = 0
+
+proc h2HeaderOverflows*(): int =
+  ## Responses refused because they carried more headers than a stream can
+  ## submit. Counted rather than shrugged off: this used to trim silently.
+  gH2HeaderOverflows
+
 proc submitResponseFor(s: var H2Session; idx: int) =
   ## Build the `Request`, call the handler, and submit the `Response` headers +
   ## a body data provider for stream `idx`.
@@ -275,12 +286,21 @@ proc submitResponseFor(s: var H2Session; idx: int) =
   let req = parseRequest(raw)
 
   var resp = s.handler(req)
+
+  # A response with more headers than a stream can carry used to be TRIMMED
+  # here, silently: the 40th header onwards simply never went out. A dropped
+  # `Set-Cookie` or `Location` is a wrong response, and a wrong response that
+  # looks fine is worse than a refused one — so overflow is a 500, and counted.
+  if resp.headers.len + 1 > MaxH2ResponseHeaders:
+    inc gH2HeaderOverflows
+    resp = response(500, "text/plain", "response header list too long\n")
+
   s.streams[idx].respBody = resp.body
 
   # Build response header list. :status first, then the response's own headers.
-  var names = default(array[40, string])
-  var values = default(array[40, string])
-  var nv = default(array[40, Nghttp2Nv])
+  var names = default(array[MaxH2ResponseHeaders, string])
+  var values = default(array[MaxH2ResponseHeaders, string])
+  var nv = default(array[MaxH2ResponseHeaders, Nghttp2Nv])
   var count = 0
   var statusStr = ""
   appendInt(statusStr, resp.status)

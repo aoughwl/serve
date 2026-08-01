@@ -42,6 +42,20 @@ const
 # a deployment cannot move is not a guard, it is a guess.
 
 var gReadTimeoutMs = ReadTimeoutMillis
+var gMaxRequestBytes = MaxRequestBytes
+var gMaxKeepAlive = MaxKeepAliveRequests
+
+proc setServeLimits*(maxRequestBytes = MaxRequestBytes;
+                     maxKeepAlive = MaxKeepAliveRequests) =
+  ## Resource bounds for subsequently served connections. The blocking and
+  ## reactor servers ship different keep-alive defaults (100 vs 1000) for the
+  ## reason the models differ — a kept-alive connection costs a THREAD here and
+  ## a coroutine there — but neither is a law any more.
+  gMaxRequestBytes = maxRequestBytes
+  gMaxKeepAlive = maxKeepAlive
+
+proc serveLimits*(): tuple[maxRequestBytes: int, maxKeepAlive: int] =
+  (gMaxRequestBytes, gMaxKeepAlive)
 
 proc setServeReadTimeout*(ms: int) =
   ## Per-socket read timeout for every subsequently served connection.
@@ -307,7 +321,7 @@ proc readFullRequest(c: var ServerConn; raw: var string; tooLarge: var bool): bo
           return true
       elif raw.len >= headerEnd + contentLen:
         return true
-    if raw.len >= MaxRequestBytes:
+    if raw.len >= gMaxRequestBytes:
       tooLarge = true
       return false
     let n = connRead(c, addr buf[0], buf.len)
@@ -334,7 +348,7 @@ proc serveConnCore(c: var ServerConn; handler: Handler) =
   connSetReadTimeout(c, gReadTimeoutMs)
   var count = 0
   var alive = true
-  while alive and count < MaxKeepAliveRequests:
+  while alive and count < gMaxKeepAlive:
     var raw = ""
     var tooLarge = false
     if not readFullRequest(c, raw, tooLarge):
@@ -346,7 +360,7 @@ proc serveConnCore(c: var ServerConn; handler: Handler) =
     else:
       let req = parseRequest(raw)
       var resp = handler(req)
-      let ka = keepAliveWanted(req) and (count + 1 < MaxKeepAliveRequests)
+      let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
       if not hasHeader(resp.headers, "Connection"):
         if ka:
           resp.withHeader("Connection", "keep-alive")
@@ -375,7 +389,7 @@ proc serveConnCoreNimcall(c: var ServerConn; handler: NimcallHandler) =
   connSetReadTimeout(c, gReadTimeoutMs)
   var count = 0
   var alive = true
-  while alive and count < MaxKeepAliveRequests:
+  while alive and count < gMaxKeepAlive:
     var raw = ""
     var tooLarge = false
     if not readFullRequest(c, raw, tooLarge):
@@ -387,7 +401,7 @@ proc serveConnCoreNimcall(c: var ServerConn; handler: NimcallHandler) =
     else:
       let req = parseRequest(raw)
       var resp = handler(req)
-      let ka = keepAliveWanted(req) and (count + 1 < MaxKeepAliveRequests)
+      let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
       if not hasHeader(resp.headers, "Connection"):
         if ka:
           resp.withHeader("Connection", "keep-alive")

@@ -30,14 +30,26 @@ type
   ReactorHandler* = proc(req: Request): Response {.nimcall.}
 
 const
-  MaxRequestBytes = 8 * 1024 * 1024
-  MaxKeepAlive = 1000
+  MaxRequestBytes* = 8 * 1024 * 1024   ## default whole-request cap -> 413
+  MaxKeepAlive* = 1000                 ## default requests per kept-alive connection
   ReadChunk = 4096
   IdleTimeoutMs = 60_000   ## keep-alive idle limit, nginx's neighbourhood
   MaxDrainBytes = 64 * 1024
 
 var gHandler: nil ReactorHandler = nil
 var gIdleMs = IdleTimeoutMs
+var gMaxRequestBytes = MaxRequestBytes
+var gMaxKeepAlive = MaxKeepAlive
+
+proc setReactorLimits*(maxRequestBytes = MaxRequestBytes; maxKeepAlive = MaxKeepAlive) =
+  ## Resource bounds for subsequently accepted connections. Both were `const`,
+  ## which meant a deployment could not raise a cap for a large upload nor lower
+  ## one under memory pressure.
+  gMaxRequestBytes = maxRequestBytes
+  gMaxKeepAlive = maxKeepAlive
+
+proc reactorLimits*(): tuple[maxRequestBytes: int, maxKeepAlive: int] =
+  (gMaxRequestBytes, gMaxKeepAlive)
 var gTlsCtx = TlsContext(handle: nil, mode: tlsClient, stateId: 0)
 
 # ---------------------------------------------------------------------------
@@ -156,7 +168,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
   r.awaitConnHandshake(c, handshook)
   var alive = handshook
   var count = 0
-  while alive and count < MaxKeepAlive:
+  while alive and count < gMaxKeepAlive:
     # --- read one full request into `raw` -----------------------------------
     var raw = ""
     var headerEnd = -1
@@ -184,7 +196,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
         else:
           if raw.len >= headerEnd + contentLen:
             complete = true
-      if (not complete) and raw.len >= MaxRequestBytes:
+      if (not complete) and raw.len >= gMaxRequestBytes:
         connErr = true
       if (not complete) and (not connErr):
         var n = 0
@@ -206,7 +218,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
         raw = header & body
       let req = parseRequest(raw)
       var resp = gHandler(req)
-      let ka = keepAliveWanted(req) and (count + 1 < MaxKeepAlive)
+      let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
       if not hasHeader(resp.headers, "Connection"):
         if ka:
           resp.withHeader("Connection", "keep-alive")
