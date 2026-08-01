@@ -127,6 +127,29 @@ Defaults: 60 s for HTTP/1.1 and HTTP/2, **off** for WebSocket (a silent
 subscription is not a stalled one). All three take an `idleTimeoutMs` argument.
 *Verified: `tests/reactor_idle_timeout.sh`.*
 
+## Calling out: the async client
+
+The stack could *serve* asynchronously and could only *call* synchronously —
+`net`, `tls` and `requests` all block the calling thread. On a single-threaded
+server that is fatal: one upstream call stops every other connection, so a
+server could not proxy, fire a webhook, or read an upstream API without giving
+up the model.
+
+`serve/asyncclient.nim` adds `awaitConnect` and `awaitFetch`: connect, TLS
+handshake, request, response — every step suspending, all inside the calling
+coroutine. `http`'s new `parseResponse` does the parsing (it could build a
+response but not read one, which is exactly the server-shaped gap).
+
+Scope is stated, not implied: HTTP/1.1, one request per connection
+(`Connection: close`), no pooling and no redirect following — those are policy
+and belong above this. **DNS resolution blocks**: `getaddrinfo` has no
+non-blocking form worth the name, so a hostname costs the reactor thread the
+lookup and an IP literal costs nothing.
+
+*Verified: `tests/reactor_proxy_e2e.sh` — 12 concurrent requests proxied
+through a deliberately 0.5s upstream finish in ~0.5s, not the ~6s a blocking
+fetch would take. The number IS the assertion.*
+
 ## Timers that resume, not just timers that kill
 
 The idle timeout above ends a connection. A protocol with timers of its OWN —
