@@ -28,6 +28,7 @@ import tcp
 import net
 import tls
 import static
+import ./crashcontext
 
 const
   MaxRequestBytes* = 8 * 1024 * 1024   ## reject requests larger than this → 413
@@ -359,7 +360,9 @@ proc serveConnCore(c: var ServerConn; handler: Handler) =
       alive = false
     else:
       let req = parseRequest(raw)
+      setCrashContext(req.meth, req.path)
       var resp = handler(req)
+      clearCrashContext()
       let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
       if not hasHeader(resp.headers, "Connection"):
         if ka:
@@ -400,7 +403,9 @@ proc serveConnCoreNimcall(c: var ServerConn; handler: NimcallHandler) =
       alive = false
     else:
       let req = parseRequest(raw)
+      setCrashContext(req.meth, req.path)
       var resp = handler(req)
+      clearCrashContext()
       let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
       if not hasHeader(resp.headers, "Connection"):
         if ka:
@@ -447,6 +452,7 @@ proc serve*(port: int; handler: Handler; maxRequests = 0) =
   ## Run a programmable plaintext server on `port`. Loops forever unless
   ## `maxRequests > 0`, in which case it exits after that many CONNECTIONS.
   initTcp()
+  installCrashContext()
   let l = listenTcp(port)
   if l == InvalidTcpHandle:
     echo "failed to listen on :", port
@@ -477,6 +483,7 @@ proc serveTls*(port: int; ctx0: TlsContext; handler: Handler;
   ## Each accepted connection gets its own TLS session over that shared context,
   ## then runs the same handler loop as `serve`.
   initTcp()
+  installCrashContext()
   var ctx = ctx0
   if not ctx.isValid:
     echo "invalid TLS context: ", lastTlsError()

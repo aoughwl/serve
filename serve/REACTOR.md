@@ -224,6 +224,39 @@ This is what let HTTP/3 stop running a private epoll loop and join the shared
 reactor — and therefore what makes one thread able to serve TCP and QUIC at
 once.
 
+## When a handler fails
+
+A handler **cannot raise**. `Handler` and `ReactorHandler` carry no `.raises`,
+so nimony rejects a `raise` inside one at compile time, and a call to any
+`.raises` routine must be wrapped there. The whole "one bad request takes the
+process down via an uncaught exception" class is excluded by the type system; a
+try/except around the handler call would add nothing.
+
+What a handler can still do is commit a **defect** — an out-of-bounds index, a
+nil dereference, a failed assertion inside something it called. Those are not
+exceptions and are not catchable: `panic` in `std/system/panics.nim` writes its
+message and calls `exit(1)`. The process dies, the connection gets no reply, and
+a supervisor restarts it. That is defensible; what was not defensible is that the
+message named no request —
+
+    seqimpl.nim(167, 41): i < s.len and 0 <= i [AssertionDefect]
+
+`serve/crashcontext.nim` keeps the in-flight request in a preallocated buffer and
+prints it as the process leaves:
+
+    serve: died while handling: GET /boom
+
+The hook is **`atexit`**, not a signal handler. Nothing raises SIGABRT on this
+path — the first version of the module installed signal handlers and printed
+nothing at all. Signal handlers are still there for the faults `exit` cannot
+cover (SIGSEGV, SIGBUS, SIGILL, SIGFPE), and those paths use only `write(2)`.
+A clean shutdown clears the context, so a graceful stop stays silent — a crash
+line that appeared on every exit would mean nothing.
+
+*Verified: `tests/reactor_crash_context.sh`, which checks liveness by the PORT
+rather than by a pid — `pgrep` also matches the shell wrapper and will report a
+corpse as alive, which it did during this work.*
+
 ## Stopping
 
 `run()` used to loop until the process was killed, so the only way to end a

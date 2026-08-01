@@ -23,6 +23,7 @@ import ./reactor
 import ./asyncio
 import ./asyncconn
 import ./stream
+import ./crashcontext
 import http/request
 import http/response
 import http/headers
@@ -263,6 +264,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
       # for the next piece while this coroutine — which can suspend — writes it.
       if gWantsStream(req):
         streamed = true
+        setCrashContext(req.meth, req.path)
         var sr = gStreamHandler(req)
         var streamOk = false
         let head = streamHeaderBlock(sr, req.version)
@@ -346,6 +348,10 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
       # coroutine transform mishandles (see REACTOR.md), so the exit rides on a
       # flag like every other exit in this file.
       if not streamed:
+       # A handler cannot raise (no `.raises` on the type) but it can commit a
+       # defect, which is fatal and uncatchable. Recording the request first is
+       # what makes the resulting abort name the request that caused it.
+       setCrashContext(req.meth, req.path)
        var resp = gHandler(req)
        let ka = keepAliveWanted(req) and (count + 1 < gMaxKeepAlive)
        if not hasHeader(resp.headers, "Connection"):
@@ -366,6 +372,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
          wrote = true
        else:
          r.awaitConnWriteAll(c, addr outBuf[0], outBuf.len, wrote)
+       clearCrashContext()
        if not wrote:
          alive = false
        else:
@@ -409,6 +416,7 @@ proc serveHttpReactor*(port: int; handler: ReactorHandler;
   ## coroutine indefinitely.
   gHandler = handler
   gIdleMs = idleTimeoutMs
+  installCrashContext()
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
     return

@@ -19,6 +19,7 @@ import std/syncio
 import http/headers
 import http/request
 import http/response
+import ./crashcontext
 import tcp
 import net
 import tls
@@ -285,7 +286,9 @@ proc submitResponseFor(s: var H2Session; idx: int) =
   raw.add s.streams[idx].body
   let req = parseRequest(raw)
 
+  setCrashContext(req.meth, req.path)
   var resp = s.handler(req)
+  clearCrashContext()
 
   # A response with more headers than a stream can carry used to be TRIMMED
   # here, silently: the 40th header onwards simply never went out. A dropped

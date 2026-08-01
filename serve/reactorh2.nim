@@ -29,6 +29,7 @@ import ./asynctls
 import ./asyncconn
 import ./reactorhttp
 import ./http2
+import ./crashcontext
 import http/request
 import http/response
 
@@ -115,6 +116,7 @@ proc serveHttp2Reactor*(port: int; handler: H2Handler;
   ## `curl --http2-prior-knowledge http://host:port/`.
   gH2Handler = handler
   gIdleMs = idleTimeoutMs
+  installCrashContext()
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
     return
