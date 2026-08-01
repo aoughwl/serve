@@ -31,8 +31,10 @@ const
   MaxRequestBytes = 8 * 1024 * 1024
   MaxKeepAlive = 1000
   ReadChunk = 4096
+  IdleTimeoutMs = 60_000   ## keep-alive idle limit, nginx's neighbourhood
 
 var gHandler: nil ReactorHandler = nil
+var gIdleMs = IdleTimeoutMs
 
 # ---------------------------------------------------------------------------
 # framing helpers (mirrors serve/loop.nim; reimplemented so this module is
@@ -227,12 +229,18 @@ proc acceptLoopHttp(r: Reactor; listenFd: cint) {.passive.} =
     else:
       discard setTcpNonBlocking(fd)
       r.register(fd)
+      r.setIdleTimeout(fd, gIdleMs)
       r.spawn(delay(handleHttpConn(r, fd)))
 
-proc serveHttpReactor*(port: int; handler: ReactorHandler) =
+proc serveHttpReactor*(port: int; handler: ReactorHandler;
+                       idleTimeoutMs = IdleTimeoutMs) =
   ## Serve HTTP/1.1 on `port` with a single-threaded epoll reactor. Blocks,
-  ## multiplexing all connections on this one thread.
+  ## multiplexing all connections on this one thread. A connection that goes
+  ## silent for `idleTimeoutMs` — mid-request or between keep-alive requests —
+  ## is dropped; 0 disables that, which is what lets a slowloris peer hold a
+  ## coroutine indefinitely.
   gHandler = handler
+  gIdleMs = idleTimeoutMs
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
     return

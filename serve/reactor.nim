@@ -15,18 +15,40 @@
 ## epoll wrappers in `epoll_native`, which we own.
 
 import std/[tables, hashes]
+import tcp
 import tcp/epoll as ep
+
+type
+  Timespec = object
+    tvSec: int64
+    tvNsec: int64
+
+proc clockGettime(clkId: cint; tp: pointer): cint {.cdecl,
+  importc: "clock_gettime", header: "<time.h>".}
+  ## `tp` is typed `pointer`, not `ptr Timespec`: our hand-laid struct is
+  ## layout-compatible with the system's `struct timespec` but not the same C
+  ## type, and declaring it as such makes the C compiler warn on every build.
+
+proc nowMs*(): int64 =
+  ## Monotonic milliseconds — immune to wall-clock jumps, which is the only
+  ## clock a timeout may be measured against.
+  var ts = Timespec(tvSec: 0, tvNsec: 0)
+  discard clockGettime(cint(1), cast[pointer](addr ts))   # CLOCK_MONOTONIC
+  return ts.tvSec * 1000'i64 + ts.tvNsec div 1_000_000'i64
 
 type
   Reactor* = ref object
     epfd: cint                       ## our epoll instance
     waiting: Table[cint, Continuation]  ## fd -> parked continuation awaiting readiness
     interest: Table[cint, uint32]    ## fd -> currently-armed epoll event mask
+    idle: Table[cint, int]           ## fd -> configured idle timeout in ms
+    deadline: Table[cint, int64]     ## fd -> monotonic ms at which that idle expires
     live: int                        ## number of registered fds (loop runs while > 0)
 
 proc newReactor*(): Reactor =
   Reactor(epfd: ep.epollCreate(), waiting: initTable[cint, Continuation](),
-          interest: initTable[cint, uint32](), live: 0)
+          interest: initTable[cint, uint32](), idle: initTable[cint, int](),
+          deadline: initTable[cint, int64](), live: 0)
 
 # ---------------------------------------------------------------------------
 # fd registration
@@ -48,6 +70,10 @@ proc unregister*(r: Reactor; fd: cint) =
     dec r.live
   if r.waiting.hasKey(fd):
     r.waiting.del(fd)
+  if r.idle.hasKey(fd):
+    r.idle.del(fd)
+  if r.deadline.hasKey(fd):
+    r.deadline.del(fd)
 
 proc arm(r: Reactor; fd: cint; mask: uint32) =
   ## Ensure epoll is watching `fd` for `mask` (EPOLLIN/EPOLLOUT).
@@ -68,12 +94,60 @@ proc spawn*(r: Reactor; k: Continuation) =
   ## instead of parking.
   complete(k)
 
+proc setIdleTimeout*(r: Reactor; fd: cint; ms: int) =
+  ## Give `fd` an idle timeout: if it ever stays un-ready for `ms` milliseconds
+  ## while a coroutine is parked on it, the reactor shuts the socket down, which
+  ## surfaces to that coroutine as an ordinary EOF — no new control flow in the
+  ## servers, and no coroutine parked forever on a peer that stops talking.
+  ## `ms <= 0` removes the timeout.
+  ##
+  ## The clock only runs while a coroutine is actually waiting (see `park`), so
+  ## this measures idleness, not connection age.
+  if ms <= 0:
+    if r.idle.hasKey(fd): r.idle.del(fd)
+    if r.deadline.hasKey(fd): r.deadline.del(fd)
+  else:
+    r.idle[fd] = ms
+
 proc park*(r: Reactor; fd: cint; mask: uint32; k: Continuation) =
   ## Record that the continuation `k` is waiting for `fd` to become ready for
   ## `mask`. Called by an async primitive as `r.park(fd, EPOLLIN, delay())`
   ## immediately before `suspend()`.
   r.arm(fd, mask)
   r.waiting[fd] = k
+  let ms = r.idle.getOrDefault(fd)
+  if ms > 0:
+    r.deadline[fd] = nowMs() + int64(ms)
+
+proc nextTimeoutMs(r: Reactor): cint =
+  ## How long `epoll_wait` may block: until the nearest deadline, or forever.
+  ## Linear in the number of armed deadlines — fine at these connection counts;
+  ## a heap is the upgrade if that stops being true.
+  var best = -1'i64
+  let t = nowMs()
+  for fd, dl in pairs(r.deadline):
+    let left = dl - t
+    let clamped = if left < 0'i64: 0'i64 else: left
+    if best < 0'i64 or clamped < best:
+      best = clamped
+  if best < 0'i64:
+    return -1.cint
+  return cint(best)
+
+proc expire(r: Reactor) =
+  ## Shut down every fd whose idle deadline has passed. The shutdown makes the
+  ## socket readable-at-EOF, so epoll hands the parked coroutine back its normal
+  ## end-of-connection path on the next turn.
+  if r.deadline.len == 0:
+    return
+  let t = nowMs()
+  var dead: seq[cint] = @[]
+  for fd, dl in pairs(r.deadline):
+    if dl <= t:
+      dead.add fd
+  for fd in dead:
+    r.deadline.del(fd)
+    discard shutdownTcpBoth(fd)
 
 # ---------------------------------------------------------------------------
 # the run loop == the scheduler
@@ -84,15 +158,19 @@ proc run*(r: Reactor) =
   ## registered (every connection has closed).
   var events = ep.newEventBuf(64)
   while r.live > 0:
-    let n = ep.epollWait(r.epfd, events, -1.cint)  # block until something is ready
+    # Block until something is ready, or until the nearest idle deadline.
+    let n = ep.epollWait(r.epfd, events, r.nextTimeoutMs())
     var i = 0
     while i < n:
       let fd = ep.eventFd(events, i)
       inc i
       if not r.waiting.hasKey(fd):
         continue                     # readiness for an fd nobody is parked on
+      if r.deadline.hasKey(fd):
+        r.deadline.del(fd)           # it spoke: the idle clock stops here
       let k = r.waiting.getOrDefault(fd)
       r.waiting.del(fd)
       # Drive the continuation: it retries its I/O and either finishes or
       # re-parks itself (re-populating r.waiting[fd] via park()).
       complete(k)
+    r.expire()

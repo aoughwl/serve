@@ -19,4 +19,11 @@ if paramCount() >= 1:
   try: port = parseInt(paramStr(1))
   except: port = 8090
 
-serveHttp2Reactor(port, handler)
+# Optional second argument: the idle timeout in ms, so a test can watch a silent
+# connection actually get dropped without waiting the default minute.
+var idleMs = 60_000
+if paramCount() >= 2:
+  try: idleMs = parseInt(paramStr(2))
+  except: idleMs = 60_000
+
+serveHttp2Reactor(port, handler, idleMs)

@@ -67,6 +67,28 @@ proc echoConn(r: Reactor; fd: cint) {.passive.} =
 
 See `examples/reactor_echo.nim` for the full accept loop and driver.
 
+## Idle timeouts
+
+`r.setIdleTimeout(fd, ms)` — set once per connection, right after `register` —
+bounds how long a coroutine may sit parked on a socket that never becomes ready.
+Without it a peer that completes a handshake and then says nothing holds its
+coroutine (and, for HTTP/2, one of the fixed session slots) for the life of the
+process.
+
+The clock runs only while a coroutine is actually waiting: `park` arms the
+deadline, readiness disarms it, so it measures idleness rather than connection
+age. `epoll_wait` blocks until the nearest deadline instead of forever, and an
+expiry **shuts the socket down** rather than resuming the continuation with an
+error. That is the whole trick — the coroutine then reads 0, takes the ordinary
+end-of-connection path it already has, and no server needs a line of new control
+flow. `nowMs()` is `CLOCK_MONOTONIC`, so a wall-clock jump cannot move a
+deadline. Deadline lookup is linear in the number of *parked* fds; a heap is the
+upgrade when that stops being cheap.
+
+Defaults: 60 s for HTTP/1.1 and HTTP/2, **off** for WebSocket (a silent
+subscription is not a stalled one). All three take an `idleTimeoutMs` argument.
+*Verified: `tests/reactor_idle_timeout.sh`.*
+
 ## Async servers built on the reactor
 
 The reactor is the async backbone for real protocols, each one flat coroutine

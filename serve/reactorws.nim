@@ -52,6 +52,7 @@ const ReadChunk = 4096
 const MaxMessage = 64 * 1024 * 1024   # reassembly cap -> Close 1009 past this
 
 var gWsHandler: nil WsHandler = nil
+var gWsIdleMs = 0
 
 # ---------------------------------------------------------------------------
 # small pure helpers
@@ -364,12 +365,19 @@ proc acceptLoopWs(r: Reactor; listenFd: cint) {.passive.} =
     else:
       discard setTcpNonBlocking(fd)
       r.register(fd)
+      r.setIdleTimeout(fd, gWsIdleMs)
       r.spawn(delay(handleWsConn(r, fd)))
 
-proc serveWsReactor*(port: int; handler: WsHandler) =
+proc serveWsReactor*(port: int; handler: WsHandler; idleTimeoutMs = 0) =
   ## Serve WebSocket on `port` with a single-threaded epoll reactor. `handler`
   ## receives each complete message and returns a reply (or "").
+  ##
+  ## `idleTimeoutMs` defaults to 0 — OFF — because a silent WebSocket is not a
+  ## stalled one: a subscription that says nothing for an hour is the normal
+  ## case. Set it (with an application-level ping) if the deployment wants dead
+  ## peers reaped.
   gWsHandler = handler
+  gWsIdleMs = idleTimeoutMs
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
     return

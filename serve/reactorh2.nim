@@ -32,6 +32,7 @@ export H2Handler
 const
   ReadChunk = 16384
   MaxDrainBytes = 64 * 1024   ## cap on post-FIN bytes read and discarded
+  IdleTimeoutMs = 60_000      ## a connection that says nothing for this long goes
 
 proc unsetH2Handler(req: Request): Response {.nimcall.} =
   ## Stand-in so the global is never nil: a coroutine cannot carry the nil check
@@ -40,6 +41,7 @@ proc unsetH2Handler(req: Request): Response {.nimcall.} =
   response(500, "text/plain", "no handler installed\n")
 
 var gH2Handler: H2Handler = unsetH2Handler
+var gIdleMs = IdleTimeoutMs
 
 proc handleH2Conn(r: Reactor; fd: cint) {.passive.} =
   ## Flat coroutine: drain queued frames → await more input → feed the session,
@@ -103,13 +105,18 @@ proc acceptLoopH2(r: Reactor; listenFd: cint) {.passive.} =
     else:
       discard setTcpNonBlocking(fd)
       r.register(fd)
+      r.setIdleTimeout(fd, gIdleMs)
       r.spawn(delay(handleH2Conn(r, fd)))
 
-proc serveHttp2Reactor*(port: int; handler: H2Handler) =
+proc serveHttp2Reactor*(port: int; handler: H2Handler;
+                        idleTimeoutMs = IdleTimeoutMs) =
   ## Serve h2c (HTTP/2 cleartext, prior knowledge) on `port` with a
   ## single-threaded epoll reactor, multiplexing up to `MaxH2Conns` connections.
-  ## Blocks. Test with `curl --http2-prior-knowledge http://host:port/`.
+  ## A connection idle for `idleTimeoutMs` is dropped (0 disables that, which
+  ## lets one silent peer hold a session slot forever). Blocks. Test with
+  ## `curl --http2-prior-knowledge http://host:port/`.
   gH2Handler = handler
+  gIdleMs = idleTimeoutMs
   let listenFd = listenTcp(port)
   if not isValidTcp(listenFd):
     return
