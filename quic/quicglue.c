@@ -629,16 +629,91 @@ static void fill_callbacks(ngtcp2_callbacks *cb, int server) {
   }
 }
 
+/* ---- transport parameters as runtime configuration ---------------------
+ *
+ * These eight values were literals in default_tp, so a deployment could not
+ * touch a single one of them: not the flow-control windows, not the idle
+ * timeout, not the stream budgets -- and the stream budget in particular is
+ * not a detail, since 3 H3 control streams once ate the whole of it.
+ *
+ * A field of -1 means "keep the built-in default", which is deliberately NOT
+ * the same as 0: 0 is a real, meaningful value for max_datagram_frame_size
+ * (it disables RFC 9221 datagrams, and therefore WebTransport datagrams).
+ * Collapsing the two would make "leave datagrams alone" indistinguishable
+ * from "turn datagrams off". */
+#define AQ_KEEP (-1)
+
+typedef struct {
+  int64_t max_streams_bidi;
+  int64_t max_streams_uni;
+  int64_t stream_data_bidi_local;
+  int64_t stream_data_bidi_remote;
+  int64_t stream_data_uni;
+  int64_t max_data;
+  int64_t max_idle_ms;
+  int64_t max_datagram_size;
+} aq_config;
+
+static aq_config g_cfg = { AQ_KEEP, AQ_KEEP, AQ_KEEP, AQ_KEEP,
+                           AQ_KEEP, AQ_KEEP, AQ_KEEP, AQ_KEEP };
+
+void aq_set_config(const aq_config *c) {
+  if (c) g_cfg = *c;
+  else {
+    aq_config keep = { AQ_KEEP, AQ_KEEP, AQ_KEEP, AQ_KEEP,
+                       AQ_KEEP, AQ_KEEP, AQ_KEEP, AQ_KEEP };
+    g_cfg = keep;
+  }
+}
+
+void aq_get_config(aq_config *out) {
+  if (out) *out = g_cfg;
+}
+
+/* The built-in defaults, readable rather than buried in the assignment. */
+void aq_default_config(aq_config *out) {
+  if (!out) return;
+  out->max_streams_bidi = 100;
+  out->max_streams_uni = 100;   /* 3 H3 control streams + WebTransport uni */
+  out->stream_data_bidi_local = 256 * 1024;
+  out->stream_data_bidi_remote = 256 * 1024;
+  out->stream_data_uni = 256 * 1024;
+  out->max_data = 1024 * 1024;
+  out->max_idle_ms = 30 * 1000;
+  out->max_datagram_size = 65535;   /* RFC 9221 unreliable datagrams */
+}
+
 static void default_tp(ngtcp2_transport_params *p) {
+  aq_config d;
+  aq_default_config(&d);
   ngtcp2_transport_params_default(p);
-  p->initial_max_streams_bidi = 100;
-  p->initial_max_streams_uni = 100;   /* 3 H3 control streams + WebTransport uni */
-  p->initial_max_stream_data_bidi_local = 256 * 1024;
-  p->initial_max_stream_data_bidi_remote = 256 * 1024;
-  p->initial_max_stream_data_uni = 256 * 1024;
-  p->initial_max_data = 1024 * 1024;
-  p->max_idle_timeout = 30 * NGTCP2_SECONDS;
-  p->max_datagram_frame_size = 65535;   /* RFC 9221 unreliable datagrams */
+  p->initial_max_streams_bidi =
+      g_cfg.max_streams_bidi == AQ_KEEP ? (uint64_t)d.max_streams_bidi
+                                        : (uint64_t)g_cfg.max_streams_bidi;
+  p->initial_max_streams_uni =
+      g_cfg.max_streams_uni == AQ_KEEP ? (uint64_t)d.max_streams_uni
+                                       : (uint64_t)g_cfg.max_streams_uni;
+  p->initial_max_stream_data_bidi_local =
+      g_cfg.stream_data_bidi_local == AQ_KEEP
+          ? (uint64_t)d.stream_data_bidi_local
+          : (uint64_t)g_cfg.stream_data_bidi_local;
+  p->initial_max_stream_data_bidi_remote =
+      g_cfg.stream_data_bidi_remote == AQ_KEEP
+          ? (uint64_t)d.stream_data_bidi_remote
+          : (uint64_t)g_cfg.stream_data_bidi_remote;
+  p->initial_max_stream_data_uni =
+      g_cfg.stream_data_uni == AQ_KEEP ? (uint64_t)d.stream_data_uni
+                                       : (uint64_t)g_cfg.stream_data_uni;
+  p->initial_max_data =
+      g_cfg.max_data == AQ_KEEP ? (uint64_t)d.max_data
+                                : (uint64_t)g_cfg.max_data;
+  p->max_idle_timeout =
+      (ngtcp2_duration)(g_cfg.max_idle_ms == AQ_KEEP ? d.max_idle_ms
+                                                     : g_cfg.max_idle_ms) *
+      NGTCP2_MILLISECONDS;
+  p->max_datagram_frame_size =
+      g_cfg.max_datagram_size == AQ_KEEP ? (uint64_t)d.max_datagram_size
+                                         : (uint64_t)g_cfg.max_datagram_size;
 }
 
 /* ====================================================================== */
