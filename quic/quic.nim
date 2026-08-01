@@ -45,6 +45,8 @@ proc aqClientWtSendDatagram(c: QuicCtx; data: ptr char; len: cint): cint
   {.importc: "aq_client_wt_send_datagram", dynlib: lib.}
 proc aqWtSendDatagram(c: QuicCtx; connToken: uint64; data: ptr char; len: cint): cint
   {.importc: "aq_wt_send_datagram", dynlib: lib.}
+proc aqStats(c: QuicCtx; dest: ptr uint64; n: cint): cint
+  {.importc: "aq_stats", dynlib: lib.}
 proc aqConnToken(c: QuicCtx): cint {.importc: "aq_conn_token", dynlib: lib.}
 proc aqWtOpenStream(c: QuicCtx; connToken: uint64; uni: cint): int64
   {.importc: "aq_wt_open_stream", dynlib: lib.}
@@ -108,8 +110,9 @@ proc takeRequest*(c: QuicCtx): H3Request =
   result = default(H3Request)
   var id = 0'u64
   var mbuf = default(array[16, char])
-  var pbuf = default(array[512, char])
-  let got = aqTakeRequest(c, addr id, addr mbuf[0], 16.cint, addr pbuf[0], 512.cint)
+  var pbuf = default(array[2048, char])
+  let got = aqTakeRequest(c, addr id, addr mbuf[0], 16.cint, addr pbuf[0],
+                          2048.cint)
   if got == 1.cint:
     result.ok = true
     result.id = id
@@ -120,7 +123,7 @@ proc takeRequest*(c: QuicCtx): H3Request =
       inc i
     result.path = ""
     i = 0
-    while i < 512 and pbuf[i] != '\0':
+    while i < 2048 and pbuf[i] != '\0':
       result.path.add pbuf[i]
       inc i
     # request body (POST payloads); empty for GET
@@ -213,6 +216,38 @@ proc clientWtSendDatagram*(c: QuicCtx; data: string) =
     buf[i] = data[i]
     inc i
   discard aqClientWtSendDatagram(c, addr buf[0], cint(buf.len))
+
+# ---- drop counters ---------------------------------------------------------
+type QuicStats* = object
+  ## Every bounded resource in the shim can fill up. With fixed capacities a
+  ## drop is unavoidable — but it must never be invisible, so each one is
+  ## counted here. A non-zero field means a capacity needs raising.
+  sendFailed*: uint64      ## `sendto` failed (full kernel send buffer)
+  dgramOutDropped*: uint64 ## outgoing datagram queue full
+  dgramInDropped*: uint64  ## incoming datagram queue full
+  connRefused*: uint64     ## connection table full
+  cidDropped*: uint64      ## CID routing table full
+  reqDropped*: uint64      ## request queue full
+  truncated*: uint64       ## a request `:path` / `:method` did not fit
+
+proc stats*(c: QuicCtx): QuicStats =
+  ## Read the shim's drop counters. All zero is the healthy case.
+  result = default(QuicStats)
+  var v = default(array[7, uint64])
+  discard aqStats(c, addr v[0], 7.cint)
+  result.sendFailed = v[0]
+  result.dgramOutDropped = v[1]
+  result.dgramInDropped = v[2]
+  result.connRefused = v[3]
+  result.cidDropped = v[4]
+  result.reqDropped = v[5]
+  result.truncated = v[6]
+
+proc anyDrops*(s: QuicStats): bool =
+  ## True if the shim dropped anything at all — a one-line health check.
+  s.sendFailed > 0'u64 or s.dgramOutDropped > 0'u64 or
+    s.dgramInDropped > 0'u64 or s.connRefused > 0'u64 or
+    s.cidDropped > 0'u64 or s.reqDropped > 0'u64 or s.truncated > 0'u64
 
 proc connToken*(c: QuicCtx): int =
   ## The first live connection's token. A client has exactly one connection, so

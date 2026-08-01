@@ -37,4 +37,5 @@ rm -rf "$NC"
 echo "$OUT" | grep -q "WT_SESSION=established" || { echo "FAIL: no WT session"; exit 1; }
 echo "$OUT" | grep -q "WT_BIDI_ECHO=wt-bidi-hello" || { echo "FAIL: no bidi echo"; exit 1; }
 echo "$OUT" | grep -q "WT_UNI_ANSWER=srv:wt-uni-hello" || { echo "FAIL: no uni answer"; exit 1; }
+echo "$OUT" | grep -q "QUIC_DROPS=none" || { echo "FAIL: the shim dropped something"; exit 1; }
 echo PASS

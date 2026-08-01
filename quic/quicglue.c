@@ -38,11 +38,24 @@
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
 
+/* Fixed capacities. Overridable at build time (-DMAX_CONNS=…) until they become
+ * runtime configuration; every one of them counts its overflow in AqStats
+ * rather than dropping silently. */
+#ifndef MAX_CONNS
 #define MAX_CONNS 64
+#endif
+#ifndef MAX_STREAMS
 #define MAX_STREAMS 64
+#endif
+#ifndef MAX_WT
 #define MAX_WT 32
+#endif
+#ifndef MAX_CIDS
 #define MAX_CIDS 256
+#endif
+#ifndef MAX_REQ
 #define MAX_REQ 256
+#endif
 #define SEND_BUF 1452
 #define SCIDLEN 16
 #define DBG(...) do{ if(getenv("AQ_DEBUG")) fprintf(stderr, __VA_ARGS__);}while(0)
@@ -54,7 +67,7 @@ typedef struct {
   int fin_recv;          /* request stream fully received */
   int queued;            /* pushed to the request queue */
   char method[16]; int method_len;
-  char path[512];  int path_len;
+  char path[2048]; int path_len;
   char protocol[24]; int protocol_len;   /* extended-CONNECT :protocol */
   int status;            /* client: response status */
   /* request/response body buffer (recv on server, recv on client) */
@@ -117,6 +130,17 @@ typedef struct {
 /* ---- pending request handles (server) --------------------------------- */
 typedef struct { Conn *conn; int64_t stream_id; int used; } ReqEntry;
 
+/* ---- drop counters ----------------------------------------------------- */
+typedef struct {
+  uint64_t tx_send;        /* sendto() failed (EAGAIN on a full send buffer…) */
+  uint64_t tx_dgram;       /* outgoing datagram queue full */
+  uint64_t rx_dgram;       /* incoming datagram queue full */
+  uint64_t conns;          /* MAX_CONNS reached, connection refused */
+  uint64_t cids;           /* CID routing table full */
+  uint64_t reqs;           /* request queue full */
+  uint64_t truncated;      /* a request path/method did not fit its buffer */
+} AqStats;
+
 typedef struct aq_ctx {
   int is_server;
   int fd;
@@ -136,6 +160,10 @@ typedef struct aq_ctx {
   int cli_wt, cli_wt_ready, cli_wt_submitted;   /* WebTransport client */
   /* incoming datagrams (from any connection) */
   struct { int conn_idx; char *data; int len; int used; } idg[128];
+  /* every bounded resource in here can fill up. When one does the packet or
+   * request is dropped — that is unavoidable with fixed capacities, but it must
+   * never be invisible. Each drop is counted here and readable via aq_stats. */
+  AqStats stats;
 } aq_ctx;
 
 /* ====================================================================== */
@@ -178,6 +206,8 @@ static void cid_add(aq_ctx *c, const uint8_t *cid, size_t len, Conn *conn) {
       c->cids[i].len = len; c->cids[i].conn = conn; return;
     }
   }
+  c->stats.cids++;
+  DBG("cid table full (%d) — connection will lose a routing entry\n", MAX_CIDS);
 }
 static void cid_del(aq_ctx *c, const uint8_t *cid, size_t len) {
   for (int i = 0; i < MAX_CIDS; i++)
@@ -309,9 +339,18 @@ static int h3_recv_header(nghttp3_conn *h3, int64_t stream_id,
   if (cn->ctx->is_server) {
     if (nv.len == 7 && memcmp(nv.base, ":method", 7) == 0) {
       int n = vv.len < 15 ? (int)vv.len : 15;
+      if ((int)vv.len > n) {
+        cn->ctx->stats.truncated++;
+        DBG(":method truncated %zu -> %d bytes\n", vv.len, n);
+      }
       memcpy(s->method, vv.base, n); s->method_len = n;
     } else if (nv.len == 5 && memcmp(nv.base, ":path", 5) == 0) {
-      int n = vv.len < 511 ? (int)vv.len : 511;
+      int cap = (int)sizeof(s->path) - 1;
+      int n = (int)vv.len < cap ? (int)vv.len : cap;
+      if ((int)vv.len > n) {
+        cn->ctx->stats.truncated++;
+        DBG(":path truncated %zu -> %d bytes\n", vv.len, n);
+      }
       memcpy(s->path, vv.base, n); s->path_len = n;
     } else if (nv.len == 9 && memcmp(nv.base, ":protocol", 9) == 0) {
       int n = vv.len < 23 ? (int)vv.len : 23;
@@ -346,6 +385,9 @@ static void queue_request(aq_ctx *c, Conn *cn, int64_t stream_id) {
   for (int i = 0; i < MAX_REQ; i++)
     if (!c->reqs[i].used) { c->reqs[i].used = 1; c->reqs[i].conn = cn;
       c->reqs[i].stream_id = stream_id; return; }
+  c->stats.reqs++;
+  DBG("request queue full (%d) — dropping stream %lld\n", MAX_REQ,
+      (long long)stream_id);
 }
 
 static int h3_end_stream(nghttp3_conn *h3, int64_t stream_id,
@@ -548,9 +590,13 @@ static int ng_recv_datagram(ngtcp2_conn *conn, uint32_t flags,
       c->idg[i].data = malloc(plen > 0 ? plen : 1);
       memcpy(c->idg[i].data, p, plen);
       c->idg[i].len = (int)plen;
-      break;
+      return 0;
     }
   }
+  /* datagrams are unreliable by contract, so dropping one is legal — but the
+   * application still has to be able to see that it happened. */
+  c->stats.rx_dgram++;
+  DBG("incoming datagram queue full (128) — dropped %zu bytes\n", plen);
   return 0;
 }
 
@@ -766,7 +812,11 @@ static Conn *server_accept(aq_ctx *c, const uint8_t *pkt, size_t pktlen,
   int _ar = ngtcp2_accept(&hd, pkt, pktlen);
   if (_ar != 0) { DBG("ngtcp2_accept rv=%d\n", _ar); return NULL; }
   Conn *cn = conn_alloc(c);
-  if (!cn) return NULL;
+  if (!cn) {
+    c->stats.conns++;
+    DBG("connection table full (%d) — refusing new connection\n", MAX_CONNS);
+    return NULL;
+  }
   memcpy(&cn->remote, ra, ralen); cn->remotelen = ralen;
   memcpy(&cn->local, &c->local, c->locallen); cn->locallen = c->locallen;
 
@@ -796,6 +846,22 @@ static Conn *server_accept(aq_ctx *c, const uint8_t *pkt, size_t pktlen,
 }
 
 /* ====================================================================== */
+/* One place where packets actually leave. ngtcp2 has already decided this
+ * packet may be sent, so a failure here is the kernel's send buffer, not
+ * congestion: QUIC will retransmit, but the loss must still be countable
+ * rather than silent. */
+static void udp_send(aq_ctx *c, Conn *cn, const uint8_t *buf, size_t len) {
+  ssize_t n;
+  do {
+    n = sendto(c->fd, buf, len, 0,
+               (struct sockaddr *)&cn->remote, cn->remotelen);
+  } while (n < 0 && errno == EINTR);
+  if (n < 0) {
+    c->stats.tx_send++;
+    DBG("sendto failed: %s (%zu bytes)\n", strerror(errno), len);
+  }
+}
+
 /* the write loop: pull packets from ngtcp2 (+ nghttp3) and sendto          */
 /* ====================================================================== */
 static void conn_close(aq_ctx *c, Conn *cn) {
@@ -854,8 +920,7 @@ static int conn_write(aq_ctx *c, Conn *cn) {
     if (cn->h3 && ndatalen >= 0)
       nghttp3_conn_add_write_offset(cn->h3, stream_id, (size_t)ndatalen);
     if (nwrite == 0) break;   /* nothing more to send right now */
-    sendto(c->fd, buf, (size_t)nwrite, 0,
-           (struct sockaddr *)&cn->remote, cn->remotelen);
+    udp_send(c, cn, buf, (size_t)nwrite);
   }
 #if AQ_WEBTRANSPORT
   /* WebTransport stream payload: written straight onto its QUIC stream, since
@@ -886,8 +951,7 @@ static int conn_write(aq_ctx *c, Conn *cn) {
       }
       if (ndatalen > 0) w->soff += (int)ndatalen;
       if (nw == 0) break;               /* congestion/flow limited for now */
-      sendto(c->fd, buf, (size_t)nw, 0,
-             (struct sockaddr *)&cn->remote, cn->remotelen);
+      udp_send(c, cn, buf, (size_t)nw);
       /* ngtcp2 only carries the FIN once the whole offered buffer went out */
       if (w->send_fin && (ngtcp2_ssize)remain == (ndatalen > 0 ? ndatalen : 0))
         w->fin_sent = 1;
@@ -904,8 +968,7 @@ static int conn_write(aq_ctx *c, Conn *cn) {
         NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0, &v, 1, ts);
     if (nw < 0) break;
     if (nw > 0)
-      sendto(c->fd, buf, (size_t)nw, 0,
-             (struct sockaddr *)&cn->remote, cn->remotelen);
+      udp_send(c, cn, buf, (size_t)nw);
     if (accepted) {
       free(cn->odg[h]); cn->odg[h] = NULL;
       cn->odg_head = (h + 1) % 8; cn->odg_n--;
@@ -1148,7 +1211,11 @@ int aq_request_body(aq_ctx *c, uint64_t req_id, char *buf, int cap) {
 }
 
 static int enqueue_dgram(Conn *cn, const char *data, int len) {
-  if (cn->odg_n >= 8) return -1;
+  if (cn->odg_n >= 8) {
+    cn->ctx->stats.tx_dgram++;
+    DBG("outgoing datagram queue full (8) — dropping %d bytes\n", len);
+    return -1;
+  }
   int slot = (cn->odg_head + cn->odg_n) % 8;
   cn->odg[slot] = malloc(len > 0 ? len : 1);
   if (len > 0) memcpy(cn->odg[slot], data, len);
@@ -1211,6 +1278,17 @@ int aq_client_wt_send_datagram(aq_ctx *c, const char *data, int len) {
   }
 #endif
   (void)c; (void)data; (void)len; return -1;
+}
+
+/* ---- drop counters ----------------------------------------------------- */
+int aq_stats(aq_ctx *c, uint64_t *out, int n) {
+  /* order matches the AqStats fields and quic.nim's QuicStats */
+  uint64_t v[7] = {c->stats.tx_send, c->stats.tx_dgram, c->stats.rx_dgram,
+                   c->stats.conns, c->stats.cids, c->stats.reqs,
+                   c->stats.truncated};
+  int k = n < 7 ? n : 7;
+  for (int i = 0; i < k; i++) out[i] = v[i];
+  return k;
 }
 
 /* ---- WebTransport streams (bidi + uni) -------------------------------- */

@@ -127,5 +127,19 @@ while (iter < 8000) and not (gotBidiEcho and gotUniAnswer):
 
 if not (gotBidiEcho and gotUniAnswer):
   echo "TIMEOUT: bidi=", gotBidiEcho, " uni=", gotUniAnswer
+
+# a clean run must not have dropped anything on either side
+let ss = stats(srv)
+let cs = stats(cli)
+if anyDrops(ss) or anyDrops(cs):
+  echo "QUIC_DROPS=yes send=", ss.sendFailed + cs.sendFailed,
+       " dgram_out=", ss.dgramOutDropped + cs.dgramOutDropped,
+       " dgram_in=", ss.dgramInDropped + cs.dgramInDropped,
+       " conn=", ss.connRefused + cs.connRefused,
+       " cid=", ss.cidDropped + cs.cidDropped,
+       " req=", ss.reqDropped + cs.reqDropped,
+       " trunc=", ss.truncated + cs.truncated
+else:
+  echo "QUIC_DROPS=none"
 freeCtx(srv)
 freeCtx(cli)
