@@ -8,18 +8,14 @@
 # than merely reachable.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8147}"; N="${N:-12}"
 
 command -v openssl >/dev/null 2>&1 || { echo "SKIP: openssl absent"; exit 0; }
 
 echo "== build reactor_alpn =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-ws" \
-  --path:"$H/aoughwl-compress" \
-  "$ROOT/examples/reactor_alpn.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_alpn -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" reactor_alpn)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 openssl req -x509 -newkey rsa:2048 -keyout "$NC/key.pem" -out "$NC/cert.pem" \

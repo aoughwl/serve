@@ -9,15 +9,12 @@
 # on its single thread.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8143}"; N="${N:-20}"
 
 echo "== build reactor_h2 =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-  "$ROOT/examples/reactor_h2.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_h2 -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" reactor_h2)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 "$BIN" "$PORT" >/dev/null 2>&1 &
@@ -86,3 +83,4 @@ if not acked:
 idle.close()
 print("reactor_h2_e2e: %d concurrent requests served with an idle connection parked" % N)
 PY
+echo "PASS"

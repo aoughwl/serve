@@ -8,17 +8,14 @@
 # serialise them; one stalled handshake would stop everything.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8145}"; N="${N:-30}"; REQS="${REQS:-5}"
 
 command -v openssl >/dev/null 2>&1 || { echo "SKIP: openssl absent"; exit 0; }
 
 echo "== build reactor_https =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-  "$ROOT/examples/reactor_https.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_https -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" reactor_https)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 openssl req -x509 -newkey rsa:2048 -keyout "$NC/key.pem" -out "$NC/cert.pem" \

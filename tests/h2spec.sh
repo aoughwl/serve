@@ -29,17 +29,12 @@ if [[ ! -x "$H2SPEC" ]]; then
   echo "SKIP: h2spec not installed (expected at $H2SPEC)"; exit 0
 fi
 
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
-H="$HOME"; NC="$(mktemp -d)"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
+NC="$(mktemp -d)"
 trap 'rm -rf "$NC"' EXIT
 
-build() {   # build <example-name>
-  "$NIMONY" c --nimcache:"$NC" \
-    --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-    --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-    "$ROOT/examples/$1.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-  find "$NC" -type f -name "$1" -executable | head -1
-}
+build() { build_example "$ROOT" "$NC" "$1"; }
 
 # Runs the suite against one already-listening server and enforces the baseline.
 gate() {    # gate <label> <port> [extra h2spec args...]

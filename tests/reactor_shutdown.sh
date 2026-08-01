@@ -11,15 +11,12 @@
 # refused (the listener really did close); and the process exits on its own.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8148}"
 
 echo "== build reactor_http =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-  "$ROOT/examples/reactor_http.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_http -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" reactor_http)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 "$BIN" "$PORT" >/dev/null 2>&1 &
