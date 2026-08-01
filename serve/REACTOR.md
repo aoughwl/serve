@@ -67,6 +67,28 @@ proc echoConn(r: Reactor; fd: cint) {.passive.} =
 
 See `examples/reactor_echo.nim` for the full accept loop and driver.
 
+## TLS on the reactor
+
+`serve/asynctls.nim` is `asyncio.nim`'s TLS twin: `awaitTlsHandshake`,
+`awaitTlsRead`, `awaitTlsWriteAll`. No new machinery was needed — the `tls`
+package already returns `tlsWantRead` / `tlsWantWrite` on a non-blocking socket
+instead of blocking, and those map straight onto parking against `EPOLLIN` /
+`EPOLLOUT`.
+
+Two things that are easy to get wrong:
+
+- **Set the accepted fd non-blocking *before* `wrapServer`.** `wrapServer` starts
+  the handshake; on a blocking fd it runs the whole thing right there, on the
+  reactor thread, stalling every other connection.
+- **The direction is TLS's choice, not the operation's.** A read can want
+  writability (a TLS 1.3 key update) and a write can want readability, so each
+  primitive parks on whichever the status names — never on the direction the
+  call name suggests.
+
+Teardown is `close_notify` → FIN → bounded drain, not a bare `close()`: closing
+while the peer's last bytes sit unread makes the kernel answer them with RST.
+That single detail was worth two h2spec cases.
+
 ## Idle timeouts
 
 `r.setIdleTimeout(fd, ms)` — set once per connection, right after `register` —
@@ -109,10 +131,14 @@ per connection, all multiplexed on one OS thread:
   the `user_data` pointer handed to nghttp2 must stay address-stable, which a
   coroutine local is not. Connection teardown is a FIN plus a bounded drain, not
   a bare `close()`, so the peer's last frames do not turn into an RST.
-  *Verified: **h2spec 146/146** (`tests/h2spec.sh`) — was 95/146 against the
-  blocking server, which serves one connection at a time and so wedged on any
-  connection left open — plus 20 concurrent requests with an idle connection
-  parked (`tests/reactor_h2_e2e.sh`).*
+  `serveHttp2TlsReactor(port, cert, key, handler)` is the same server over TLS
+  with ALPN `h2` — the path browsers actually take — with the handshake itself
+  pumped on the reactor (see below), so a peer that stalls mid-handshake stalls
+  only itself.
+  *Verified: **h2spec 146/146 over both h2c and TLS** (`tests/h2spec.sh`) — was
+  95/146 against the blocking server, which serves one connection at a time and
+  so wedged on any connection left open — plus 20 concurrent requests with an
+  idle connection parked (`tests/reactor_h2_e2e.sh`).*
 - **`serve/reactorws.nim`** — async **WebSocket (RFC 6455)**.
   `serveWsReactor(port, handler)` where `handler` is `proc(msg: string;
   isBinary: bool): string`. Reads the Upgrade request, completes the handshake

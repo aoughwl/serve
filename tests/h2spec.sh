@@ -31,36 +31,62 @@ fi
 
 NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
 H="$HOME"; NC="$(mktemp -d)"
+trap 'rm -rf "$NC"' EXIT
+
+build() {   # build <example-name>
+  "$NIMONY" c --nimcache:"$NC" \
+    --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
+    --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
+    "$ROOT/examples/$1.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
+  find "$NC" -type f -name "$1" -executable | head -1
+}
+
+# Runs the suite against one already-listening server and enforces the baseline.
+gate() {    # gate <label> <port> [extra h2spec args...]
+  local label="$1" port="$2"; shift 2
+  local out summary passed
+  out="$("$H2SPEC" -h 127.0.0.1 -p "$port" --timeout 3 "$@" 2>&1)"
+  summary="$(echo "$out" | grep -E '^[0-9]+ tests,' | tail -1)"
+  echo "$label: $summary"
+  passed="$(echo "$summary" | sed -E 's/.*, ([0-9]+) passed.*/\1/')"
+  if [[ -z "$passed" ]]; then
+    echo "FAIL: could not parse h2spec summary for $label"; return 1
+  fi
+  if (( passed < BASELINE )); then
+    echo "FAIL: h2spec regression on $label — $passed passed, baseline is $BASELINE"
+    echo "$out" | grep -E '^\s+×' | head -20
+    return 1
+  fi
+  if (( passed > BASELINE )); then
+    echo "IMPROVED: $label $passed passed (baseline $BASELINE) — raise BASELINE in this script"
+  fi
+  echo "PASS $label ($passed/146, baseline $BASELINE)"
+  return 0
+}
+
 echo "== build reactor_h2 =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-  "$ROOT/examples/reactor_h2.nim" 2>&1 | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_h2 -executable | head -1)"
-if [[ -z "$BIN" ]]; then
-  echo "FAIL: could not build examples/reactor_h2.nim"; rm -rf "$NC"; exit 1
-fi
+BIN="$(build reactor_h2)"
+[[ -n "$BIN" ]] || { echo "FAIL: could not build examples/reactor_h2.nim"; exit 1; }
 
 "$BIN" "$PORT" >/dev/null 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$NC"' EXIT
 sleep 1
+gate "h2c " "$PORT" || exit 1
+kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
 
-OUT="$("$H2SPEC" -h 127.0.0.1 -p "$PORT" --timeout 3 2>&1)"
-SUMMARY="$(echo "$OUT" | grep -E '^[0-9]+ tests,' | tail -1)"
-echo "$SUMMARY"
-
-PASSED="$(echo "$SUMMARY" | sed -E 's/.*, ([0-9]+) passed.*/\1/')"
-if [[ -z "$PASSED" ]]; then
-  echo "FAIL: could not parse h2spec summary"; exit 1
+# --- the same suite over TLS (ALPN h2), which is what a browser speaks -------
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "SKIP: openssl absent, TLS half of the gate not run"; exit 0
 fi
-
-if (( PASSED < BASELINE )); then
-  echo "FAIL: h2spec regression — $PASSED passed, baseline is $BASELINE"
-  echo "$OUT" | grep -E '^\s+×' | head -20
-  exit 1
-fi
-if (( PASSED > BASELINE )); then
-  echo "IMPROVED: $PASSED passed (baseline $BASELINE) — raise BASELINE in this script"
-fi
-echo "PASS ($PASSED/146, baseline $BASELINE)"
+echo "== build reactor_h2tls =="
+TBIN="$(build reactor_h2tls)"
+[[ -n "$TBIN" ]] || { echo "FAIL: could not build examples/reactor_h2tls.nim"; exit 1; }
+openssl req -x509 -newkey rsa:2048 -keyout "$NC/key.pem" -out "$NC/cert.pem" \
+  -days 2 -nodes -subj "/CN=localhost" >/dev/null 2>&1
+TPORT="$(( PORT + 1 ))"
+"$TBIN" "$TPORT" "$NC/cert.pem" "$NC/key.pem" >/dev/null 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null; rm -rf "$NC"' EXIT
+sleep 1
+gate "h2tls" "$TPORT" -t -k || exit 1
