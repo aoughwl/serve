@@ -19,6 +19,7 @@ when defined(nimony):
 import std/strutils
 import tcp
 import tls
+import ./listener
 import ./reactor
 import ./asyncio
 import ./asyncconn
@@ -90,6 +91,15 @@ proc setReactorLimits*(maxRequestBytes = MaxRequestBytes; maxKeepAlive = MaxKeep
 
 proc reactorLimits*(): tuple[maxRequestBytes: int, maxKeepAlive: int] =
   (gMaxRequestBytes, gMaxKeepAlive)
+
+proc setReactorIdleTimeout*(ms: int) =
+  ## Idle timeout for subsequently accepted connections. It was settable only
+  ## as a parameter of the entry points, so a caller who wanted the default
+  ## server with a different idle limit had no way to say so.
+  gIdleMs = ms
+
+proc reactorIdleTimeout*(): int =
+  gIdleMs
 var gTlsCtx = TlsContext(handle: nil, mode: tlsClient, stateId: 0)
 
 # ---------------------------------------------------------------------------
@@ -417,7 +427,7 @@ proc serveHttpReactor*(port: int; handler: ReactorHandler;
   gHandler = handler
   gIdleMs = idleTimeoutMs
   installCrashContext()
-  let listenFd = listenTcp(port)
+  let listenFd = serveListen(port)
   if not isValidTcp(listenFd):
     return
   discard setTcpNonBlocking(listenFd)
@@ -444,7 +454,7 @@ proc serveHttpsReactor*(port: int; ctx0: TlsContext; handler: ReactorHandler;
     return
   discard ctx.setAlpnServer(@["http/1.1"])
   gTlsCtx = ctx
-  let listenFd = listenTcp(port)
+  let listenFd = serveListen(port)
   if not isValidTcp(listenFd):
     return
   discard setTcpNonBlocking(listenFd)

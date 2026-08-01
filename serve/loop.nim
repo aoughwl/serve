@@ -28,6 +28,7 @@ import tcp
 import net
 import tls
 import static
+import ./listener
 import ./crashcontext
 
 const
@@ -453,7 +454,7 @@ proc serve*(port: int; handler: Handler; maxRequests = 0) =
   ## `maxRequests > 0`, in which case it exits after that many CONNECTIONS.
   initTcp()
   installCrashContext()
-  let l = listenTcp(port)
+  let l = serveListen(port)
   if l == InvalidTcpHandle:
     echo "failed to listen on :", port
     shutdownTcp()
@@ -489,7 +490,7 @@ proc serveTls*(port: int; ctx0: TlsContext; handler: Handler;
     echo "invalid TLS context: ", lastTlsError()
     shutdownTcp()
     return
-  let l = listenTcp(port)
+  let l = serveListen(port)
   if l == InvalidTcpHandle:
     echo "failed to listen on :", port
     ctx.close()

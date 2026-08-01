@@ -20,6 +20,7 @@ import std/syncio
 import std/rawthreads
 import tcp
 import tls
+import ./listener
 import loop
 
 const MaxWorkers* = 256
@@ -87,7 +88,7 @@ proc serveConcurrent*(port: int; handler: NimcallHandler; workers = 4) =
   ## Concurrent plaintext HTTP server: `workers` threads share one listening
   ## socket. Loops forever (workers never return).
   initTcp()
-  let l = listenTcp(port)
+  let l = serveListen(port)
   if l == InvalidTcpHandle:
     echo "failed to listen on :", port
     shutdownTcp()
@@ -111,7 +112,7 @@ proc serveTlsConcurrent*(port: int; ctx0: TlsContext;
     echo "invalid TLS context: ", lastTlsError()
     shutdownTcp()
     return
-  let l = listenTcp(port)
+  let l = serveListen(port)
   if l == InvalidTcpHandle:
     echo "failed to listen on :", port
     ctx.close()
