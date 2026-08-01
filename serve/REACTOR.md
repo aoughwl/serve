@@ -89,6 +89,15 @@ Teardown is `close_notify` → FIN → bounded drain, not a bare `close()`: clos
 while the peer's last bytes sit unread makes the kernel answer them with RST.
 That single detail was worth two h2spec cases.
 
+`serve/asyncconn.nim` then removes the "write the coroutine twice" problem.
+`Conn` is `{fd, isTls, tls}`, and `awaitConnHandshake` / `awaitConnRead` /
+`awaitConnWriteAll` / `closeConn` dispatch on `isTls`, each arm inlining the
+primitive it needs. A runtime branch is the only abstraction the coroutine
+transform allows here — the primitives must be templates — and it costs a
+predictable branch per I/O against a syscall. HTTP/1.1 and WebSocket each run
+**one** connection body for both transports; only the accept loop differs
+(`serveHttpsReactor`, `serveWssReactor`).
+
 ## Idle timeouts
 
 `r.setIdleTimeout(fd, ms)` — set once per connection, right after `register` —
@@ -120,8 +129,10 @@ per connection, all multiplexed on one OS thread:
   handler)` where `handler` is a `{.nimcall.}` `proc(req: Request): Response`.
   Reads a full request (Content-Length or chunked), runs the handler, writes the
   response, loops for keep-alive. Reuses the `http` package's parse/serialize.
+  `serveHttpsReactor(port, cert, key, handler)` is the same body over TLS.
   *Verified: 60 simultaneous keep-alive conns × 5 requests (300/300) on one
-  thread* (`tests/reactor_http_e2e.sh`).
+  thread* (`tests/reactor_http_e2e.sh`), *plus 30 simultaneous TLS conns × 5
+  (150/150)* (`tests/reactor_https_e2e.sh`).
 - **`serve/reactorh2.nim`** — async **HTTP/2 (h2c)**. `serveHttp2Reactor(port,
   handler)`, same `proc(req: Request): Response` handler shape as HTTP/1.1. The
   protocol work stays in libnghttp2, which is a pure codec — it never touches a
@@ -149,8 +160,11 @@ per connection, all multiplexed on one OS thread:
   reserved-opcode / control-frame validation, a fragmentation state machine,
   incremental UTF-8 validation of text (Höhrmann DFA in `ws/protocol`, Close 1007
   on invalid), close-code validation + echo (Close 1002), and permessage-deflate.
-  *Verified: 160/160 echo across 40 clients (`tests/reactor_ws_e2e.sh`) plus 19/19
-  conformance cases (`tests/reactor_ws_conformance.sh`) on one thread.*
+  `serveWssReactor(port, cert, key, handler)` serves **wss://** from the same
+  body. *Verified: 160/160 echo across 40 clients (`tests/reactor_ws_e2e.sh`)
+  plus 19/19 conformance cases (`tests/reactor_ws_conformance.sh`) and 80/80
+  across 20 simultaneous TLS clients (`tests/reactor_wss_e2e.sh`), on one
+  thread.*
 - **`serve/reactorh3.nim`** — async **HTTP/3 (QUIC)**.
   `serveH3Reactor(port, cert, key, handler)` where `handler` is `proc(meth, path,
   body: string): H3Response`. The QUIC transport, TLS 1.3 handshake, connection-ID

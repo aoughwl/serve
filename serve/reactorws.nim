@@ -29,8 +29,10 @@ when defined(nimony):
   {.feature: "lenientnils".}
 
 import tcp
+import tls
 import ./reactor
 import ./asyncio
+import ./asyncconn
 import http/request
 import ws/frame
 import ws/handshake
@@ -50,9 +52,11 @@ type
 
 const ReadChunk = 4096
 const MaxMessage = 64 * 1024 * 1024   # reassembly cap -> Close 1009 past this
+const MaxDrainBytes = 64 * 1024
 
 var gWsHandler: nil WsHandler = nil
 var gWsIdleMs = 0
+var gWsTlsCtx = TlsContext(handle: nil, mode: tlsClient, stateId: 0)
 
 # ---------------------------------------------------------------------------
 # small pure helpers
@@ -141,7 +145,7 @@ proc tryDecodeFrame(buf: string; f: var DecodedFrame): int =
 # send helper (template: inlines its suspend into the calling coroutine)
 # ---------------------------------------------------------------------------
 
-template awaitSendFrame(r: Reactor; fd: cint; op: Opcode; payload: string;
+template awaitSendFrame(r: Reactor; c: var Conn; op: Opcode; payload: string;
                         okOut: var bool; rsv1 = false) =
   let frameStr = encodeFrame(op, payload, true, false, [0'u8, 0'u8, 0'u8, 0'u8], rsv1)
   var sbuf = newSeq[char](frameStr.len)
@@ -152,26 +156,30 @@ template awaitSendFrame(r: Reactor; fd: cint; op: Opcode; payload: string;
   if sbuf.len == 0:
     okOut = true
   else:
-    r.awaitWriteAll(fd, addr sbuf[0], sbuf.len, okOut)
+    r.awaitConnWriteAll(c, addr sbuf[0], sbuf.len, okOut)
 
 # ---------------------------------------------------------------------------
 # the per-connection coroutine
 # ---------------------------------------------------------------------------
 
-proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
+proc handleWsConn(r: Reactor; c0: Conn) {.passive.} =
+  ## Cleartext and TLS run the same body; the transport is a Conn (asyncconn.nim).
+  var c = c0
   var buf = default(array[ReadChunk, char])
   var inbuf = ""
-  var alive = true
+  var handshook = false
+  r.awaitConnHandshake(c, handshook)
+  var alive = handshook
   var useDeflate = false
 
   # --- read the HTTP Upgrade request (until end of headers) ---------------
   var hEnd = -1
-  var reqErr = false
+  var reqErr = not handshook
   while (hEnd < 0) and (not reqErr):
     hEnd = headerEndOf(inbuf)
     if hEnd < 0:
       var n = 0
-      r.awaitRead(fd, addr buf[0], ReadChunk, n)
+      r.awaitConnRead(c, addr buf[0], ReadChunk, n)
       if n <= 0:
         reqErr = true
       else:
@@ -198,7 +206,7 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
       if sbuf.len == 0:
         ok = true
       else:
-        r.awaitWriteAll(fd, addr sbuf[0], sbuf.len, ok)
+        r.awaitConnWriteAll(c, addr sbuf[0], sbuf.len, ok)
       if not ok:
         alive = false
 
@@ -220,7 +228,7 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
     elif rc == 0:
       # need more bytes
       var n = 0
-      r.awaitRead(fd, addr buf[0], ReadChunk, n)
+      r.awaitConnRead(c, addr buf[0], ReadChunk, n)
       if n <= 0:
         alive = false
       else:
@@ -265,12 +273,12 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
         else:
           echoCode = -1                             # empty Close -> empty echo
         var ok = false
-        r.awaitSendFrame(fd, opClose, closePayload(echoCode, echoReason), ok)
+        r.awaitSendFrame(c, opClose, closePayload(echoCode, echoReason), ok)
         alive = false
 
       elif f.op == 0x9:                            # ping -> pong (echo payload)
         var ok = false
-        r.awaitSendFrame(fd, opPong, f.payload, ok)
+        r.awaitSendFrame(c, opPong, f.payload, ok)
         if not ok: alive = false
 
       elif f.op == 0xA:                            # pong -> ignore
@@ -343,17 +351,16 @@ proc handleWsConn(r: Reactor; fd: cint) {.passive.} =
                     outPayload = df.data
                     replyRsv1 = true
                 var ok = false
-                r.awaitSendFrame(fd, replyOp, outPayload, ok, replyRsv1)
+                r.awaitSendFrame(c, replyOp, outPayload, ok, replyRsv1)
                 if not ok: alive = false
 
       # ---- a queued protocol failure: send Close then stop --------------
       if pendingClose >= 0 and alive:
         var ok = false
-        r.awaitSendFrame(fd, opClose, closePayload(pendingClose, pendingReason), ok)
+        r.awaitSendFrame(c, opClose, closePayload(pendingClose, pendingReason), ok)
         alive = false
 
-  r.unregister(fd)
-  closeTcp(fd)
+  r.closeConn(c, addr buf[0], ReadChunk, MaxDrainBytes)
 
 proc acceptLoopWs(r: Reactor; listenFd: cint) {.passive.} =
   var running = true
@@ -366,7 +373,20 @@ proc acceptLoopWs(r: Reactor; listenFd: cint) {.passive.} =
       discard setTcpNonBlocking(fd)
       r.register(fd)
       r.setIdleTimeout(fd, gWsIdleMs)
-      r.spawn(delay(handleWsConn(r, fd)))
+      r.spawn(delay(handleWsConn(r, plainConn(fd))))
+
+proc acceptLoopWss(r: Reactor; listenFd: cint) {.passive.} =
+  var running = true
+  while running:
+    var fd = InvalidTcpHandle
+    r.awaitAccept(listenFd, fd)
+    if not isValidTcp(fd):
+      running = false
+    else:
+      discard setTcpNonBlocking(fd)   # BEFORE tlsConn: wrapServer starts the handshake
+      r.register(fd)
+      r.setIdleTimeout(fd, gWsIdleMs)
+      r.spawn(delay(handleWsConn(r, tlsConn(gWsTlsCtx, fd))))
 
 proc serveWsReactor*(port: int; handler: WsHandler; idleTimeoutMs = 0) =
   ## Serve WebSocket on `port` with a single-threaded epoll reactor. `handler`
@@ -385,4 +405,25 @@ proc serveWsReactor*(port: int; handler: WsHandler; idleTimeoutMs = 0) =
   let r = newReactor()
   r.register(listenFd)
   r.spawn(delay(acceptLoopWs(r, listenFd)))
+  r.run()
+
+proc serveWssReactor*(port: int; certFile: string; keyFile: string;
+                      handler: WsHandler; idleTimeoutMs = 0) =
+  ## Serve **wss://** — the same WebSocket server over TLS, same coroutine, same
+  ## thread (asyncconn.nim), with the handshake pumped asynchronously. ALPN
+  ## advertises `http/1.1`, which is what the Upgrade dance rides on.
+  gWsHandler = handler
+  gWsIdleMs = idleTimeoutMs
+  var ctx = newTlsServerContext(certFile, keyFile)
+  if not ctx.isValid:
+    return
+  discard ctx.setAlpnServer(@["http/1.1"])
+  gWsTlsCtx = ctx
+  let listenFd = listenTcp(port)
+  if not isValidTcp(listenFd):
+    return
+  discard setTcpNonBlocking(listenFd)
+  let r = newReactor()
+  r.register(listenFd)
+  r.spawn(delay(acceptLoopWss(r, listenFd)))
   r.run()

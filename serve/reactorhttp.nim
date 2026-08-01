@@ -18,8 +18,10 @@ when defined(nimony):
 
 import std/strutils
 import tcp
+import tls
 import ./reactor
 import ./asyncio
+import ./asyncconn
 import http/request
 import http/response
 import http/headers
@@ -32,9 +34,11 @@ const
   MaxKeepAlive = 1000
   ReadChunk = 4096
   IdleTimeoutMs = 60_000   ## keep-alive idle limit, nginx's neighbourhood
+  MaxDrainBytes = 64 * 1024
 
 var gHandler: nil ReactorHandler = nil
 var gIdleMs = IdleTimeoutMs
+var gTlsCtx = TlsContext(handle: nil, mode: tlsClient, stateId: 0)
 
 # ---------------------------------------------------------------------------
 # framing helpers (mirrors serve/loop.nim; reimplemented so this module is
@@ -135,11 +139,15 @@ proc chunkedComplete(s: string; start: int): bool =
 # the per-connection coroutine
 # ---------------------------------------------------------------------------
 
-proc handleHttpConn(r: Reactor; fd: cint) {.passive.} =
+proc handleHttpConn(r: Reactor; c0: Conn) {.passive.} =
   ## Flat coroutine: keep-alive loop of read-request → handle → write-response.
   ## All loop exits are via flags (never break/return beside a suspend).
+  ## Cleartext and TLS run the same body — see asyncconn.nim.
+  var c = c0
   var buf = default(array[ReadChunk, char])
-  var alive = true
+  var handshook = false
+  r.awaitConnHandshake(c, handshook)
+  var alive = handshook
   var count = 0
   while alive and count < MaxKeepAlive:
     # --- read one full request into `raw` -----------------------------------
@@ -173,7 +181,7 @@ proc handleHttpConn(r: Reactor; fd: cint) {.passive.} =
         connErr = true
       if (not complete) and (not connErr):
         var n = 0
-        r.awaitRead(fd, addr buf[0], ReadChunk, n)
+        r.awaitConnRead(c, addr buf[0], ReadChunk, n)
         if n <= 0:
           connErr = true
         else:
@@ -209,15 +217,14 @@ proc handleHttpConn(r: Reactor; fd: cint) {.passive.} =
       if outBuf.len == 0:
         wrote = true
       else:
-        r.awaitWriteAll(fd, addr outBuf[0], outBuf.len, wrote)
+        r.awaitConnWriteAll(c, addr outBuf[0], outBuf.len, wrote)
       if not wrote:
         alive = false
       else:
         inc count
         if not ka:
           alive = false
-  r.unregister(fd)
-  closeTcp(fd)
+  r.closeConn(c, addr buf[0], ReadChunk, MaxDrainBytes)
 
 proc acceptLoopHttp(r: Reactor; listenFd: cint) {.passive.} =
   var running = true
@@ -230,7 +237,20 @@ proc acceptLoopHttp(r: Reactor; listenFd: cint) {.passive.} =
       discard setTcpNonBlocking(fd)
       r.register(fd)
       r.setIdleTimeout(fd, gIdleMs)
-      r.spawn(delay(handleHttpConn(r, fd)))
+      r.spawn(delay(handleHttpConn(r, plainConn(fd))))
+
+proc acceptLoopHttps(r: Reactor; listenFd: cint) {.passive.} =
+  var running = true
+  while running:
+    var fd = InvalidTcpHandle
+    r.awaitAccept(listenFd, fd)
+    if not isValidTcp(fd):
+      running = false
+    else:
+      discard setTcpNonBlocking(fd)   # BEFORE tlsConn: wrapServer starts the handshake
+      r.register(fd)
+      r.setIdleTimeout(fd, gIdleMs)
+      r.spawn(delay(handleHttpConn(r, tlsConn(gTlsCtx, fd))))
 
 proc serveHttpReactor*(port: int; handler: ReactorHandler;
                        idleTimeoutMs = IdleTimeoutMs) =
@@ -248,4 +268,27 @@ proc serveHttpReactor*(port: int; handler: ReactorHandler;
   let r = newReactor()
   r.register(listenFd)
   r.spawn(delay(acceptLoopHttp(r, listenFd)))
+  r.run()
+
+proc serveHttpsReactor*(port: int; certFile: string; keyFile: string;
+                        handler: ReactorHandler;
+                        idleTimeoutMs = IdleTimeoutMs) =
+  ## Serve HTTP/1.1 over TLS on `port` with the same reactor and the same
+  ## connection coroutine — the transport is the only difference (asyncconn.nim).
+  ## Handshakes are pumped asynchronously too, so one stalled handshake costs
+  ## one coroutine, not the thread. ALPN advertises `http/1.1`.
+  gHandler = handler
+  gIdleMs = idleTimeoutMs
+  var ctx = newTlsServerContext(certFile, keyFile)
+  if not ctx.isValid:
+    return
+  discard ctx.setAlpnServer(@["http/1.1"])
+  gTlsCtx = ctx
+  let listenFd = listenTcp(port)
+  if not isValidTcp(listenFd):
+    return
+  discard setTcpNonBlocking(listenFd)
+  let r = newReactor()
+  r.register(listenFd)
+  r.spawn(delay(acceptLoopHttps(r, listenFd)))
   r.run()

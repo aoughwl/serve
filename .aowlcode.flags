@@ -3,4 +3,5 @@
 --path:~/aoughwl-tcp
 --path:~/aoughwl-net
 --path:~/aoughwl-tls
+--path:~/aoughwl-ws
 --path:~/aoughwl-compress
