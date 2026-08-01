@@ -75,7 +75,11 @@ const
   FRAME_TYPE_DATA = 0'u8
   FRAME_TYPE_HEADERS = 1'u8
   NGHTTP2_DATA_FLAG_EOF = 0x01'u32
+  NGHTTP2_SETTINGS_HEADER_TABLE_SIZE = 1'i32
   NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS = 3'i32
+  NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE = 4'i32
+  NGHTTP2_SETTINGS_MAX_FRAME_SIZE = 5'i32
+  NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE = 6'i32
   NGHTTP2_PROTOCOL_ERROR = 1'u32
 
 # --- per-connection session state --------------------------------------------
@@ -336,6 +340,38 @@ proc onStreamClose(session: nil pointer; streamId: int32; errorCode: uint32;
 
 const MaxH2Conns* = 128
 
+type
+  H2Settings* = object
+    ## The SETTINGS this server announces in its connection preface. Until now
+    ## exactly one was sent — MAX_CONCURRENT_STREAMS=100 — and the other four
+    ## were whatever nghttp2 defaults to, unreachable. They are the knobs that
+    ## decide how much memory one peer can make a server hold (window size ×
+    ## streams) and how large a header block it will accept, so a deployment
+    ## that cannot set them cannot be tuned or hardened.
+    ##
+    ## A field of 0 means "do not announce this one", leaving nghttp2's default
+    ## in place — except `maxConcurrentStreams`, where 0 legitimately means
+    ## "accept no new streams" and is therefore always announced.
+    maxConcurrentStreams*: uint32   ## default 100
+    initialWindowSize*: uint32      ## per-stream flow-control window; 0 = leave (64 KiB - 1)
+    maxFrameSize*: uint32           ## 0 = leave (16 KiB); valid range 16 KiB..16 MiB - 1
+    headerTableSize*: uint32        ## HPACK dynamic table; 0 = leave (4 KiB)
+    maxHeaderListSize*: uint32      ## 0 = leave (unbounded, which is a choice worth revisiting)
+
+proc defaultH2Settings*(): H2Settings =
+  H2Settings(maxConcurrentStreams: 100'u32, initialWindowSize: 0'u32,
+             maxFrameSize: 0'u32, headerTableSize: 0'u32,
+             maxHeaderListSize: 0'u32)
+
+var gH2Settings = defaultH2Settings()
+
+proc setH2Settings*(s: H2Settings) =
+  ## Announce `s` on every subsequently opened HTTP/2 session.
+  gH2Settings = s
+
+proc h2Settings*(): H2Settings =
+  gH2Settings
+
 var gH2Sessions: array[MaxH2Conns, H2Session]
 var gH2Used: array[MaxH2Conns, bool]
 var gH2Rejected = 0
@@ -380,10 +416,28 @@ proc h2OpenSession*(handler: H2Handler): int =
   nghttp2_session_callbacks_del(cbsPtr)
   gH2Used[slot] = true
 
-  var iv = default(array[1, Nghttp2SettingsEntry])
-  iv[0] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-                               value: 100'u32)
-  discard nghttp2_submit_settings(gH2Sessions[slot].session, 0'u8, addr iv[0], csize_t(1))
+  var iv = default(array[5, Nghttp2SettingsEntry])
+  var n = 0
+  iv[n] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+                               value: gH2Settings.maxConcurrentStreams)
+  inc n
+  if gH2Settings.initialWindowSize > 0'u32:
+    iv[n] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+                                 value: gH2Settings.initialWindowSize)
+    inc n
+  if gH2Settings.maxFrameSize > 0'u32:
+    iv[n] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_MAX_FRAME_SIZE,
+                                 value: gH2Settings.maxFrameSize)
+    inc n
+  if gH2Settings.headerTableSize > 0'u32:
+    iv[n] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_HEADER_TABLE_SIZE,
+                                 value: gH2Settings.headerTableSize)
+    inc n
+  if gH2Settings.maxHeaderListSize > 0'u32:
+    iv[n] = Nghttp2SettingsEntry(settingsId: NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+                                 value: gH2Settings.maxHeaderListSize)
+    inc n
+  discard nghttp2_submit_settings(gH2Sessions[slot].session, 0'u8, addr iv[0], csize_t(n))
   return slot
 
 proc h2CloseSession*(slot: int) =
