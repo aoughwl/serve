@@ -89,6 +89,13 @@ Teardown is `close_notify` → FIN → bounded drain, not a bare `close()`: clos
 while the peer's last bytes sit unread makes the kernel answer them with RST.
 That single detail was worth two h2spec cases.
 
+Every TLS entry point comes in two forms: one taking a PEM cert/key pair, and
+one taking a `TlsContext` **you** built and configured. The second exists
+because a server that constructs its own context freezes every TLS knob out of
+reach — protocol versions, cipher suites, key-exchange groups (post-quantum
+included), extra SNI certificates, session resumption. `examples/reactor_tlsconf.nim`
+is the shape: build the context, set what you need, hand it over.
+
 `serve/asyncconn.nim` then removes the "write the coroutine twice" problem.
 `Conn` is `{fd, isTls, tls}`, and `awaitConnHandshake` / `awaitConnRead` /
 `awaitConnWriteAll` / `closeConn` dispatch on `isTls`, each arm inlining the

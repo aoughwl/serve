@@ -277,16 +277,19 @@ proc serveHttpReactor*(port: int; handler: ReactorHandler;
   r.spawn(delay(acceptLoopHttp(r, listenFd)))
   r.run()
 
-proc serveHttpsReactor*(port: int; certFile: string; keyFile: string;
-                        handler: ReactorHandler;
+proc serveHttpsReactor*(port: int; ctx0: TlsContext; handler: ReactorHandler;
                         idleTimeoutMs = IdleTimeoutMs) =
   ## Serve HTTP/1.1 over TLS on `port` with the same reactor and the same
   ## connection coroutine — the transport is the only difference (asyncconn.nim).
   ## Handshakes are pumped asynchronously too, so one stalled handshake costs
   ## one coroutine, not the thread. ALPN advertises `http/1.1`.
+  ##
+  ## The context is the caller's, so every TLS knob stays reachable: protocol
+  ## versions, cipher suites, key-exchange groups (post-quantum included), extra
+  ## SNI certificates, session resumption.
   gHandler = handler
   gIdleMs = idleTimeoutMs
-  var ctx = newTlsServerContext(certFile, keyFile)
+  var ctx = ctx0
   if not ctx.isValid:
     return
   discard ctx.setAlpnServer(@["http/1.1"])
@@ -299,3 +302,10 @@ proc serveHttpsReactor*(port: int; certFile: string; keyFile: string;
   r.register(listenFd)
   r.spawn(delay(acceptLoopHttps(r, listenFd)))
   r.run()
+
+proc serveHttpsReactor*(port: int; certFile: string; keyFile: string;
+                        handler: ReactorHandler;
+                        idleTimeoutMs = IdleTimeoutMs) =
+  ## As above, with a default context built from a PEM cert chain and key.
+  serveHttpsReactor(port, newTlsServerContext(certFile, keyFile), handler,
+                    idleTimeoutMs)

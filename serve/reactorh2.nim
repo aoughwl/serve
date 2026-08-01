@@ -170,14 +170,18 @@ proc acceptLoopTlsAlpn(r: Reactor; listenFd: cint) {.passive.} =
       r.setIdleTimeout(fd, gIdleMs)
       r.spawn(delay(dispatchTlsConn(r, fd)))
 
-proc serveTlsAlpn(port: int; certFile: string; keyFile: string;
-                  alpn: seq[string]; idleTimeoutMs: int): bool =
-  ## Shared driver for the two TLS entry points below. Returns false if the
-  ## cert/key or the listener could not be brought up; otherwise it blocks.
-  gIdleMs = idleTimeoutMs
-  var ctx = newTlsServerContext(certFile, keyFile)
+proc serveTlsAlpn(port: int; ctx0: TlsContext; alpn: seq[string];
+                  idleTimeoutMs: int): bool =
+  ## Shared driver for the TLS entry points below. Returns false if the context
+  ## or the listener could not be brought up; otherwise it blocks.
+  ##
+  ## ALPN is set here rather than left to the caller: the dispatcher's choice of
+  ## protocol *is* the ALPN result, so a caller-supplied list that disagreed
+  ## with the entry point would silently mean something else.
+  var ctx = ctx0
   if not ctx.isValid:
     return false
+  gIdleMs = idleTimeoutMs
   discard ctx.setAlpnServer(alpn)
   gTlsCtx = ctx
   let listenFd = listenTcp(port)
@@ -190,22 +194,28 @@ proc serveTlsAlpn(port: int; certFile: string; keyFile: string;
   r.run()
   return true
 
-proc serveHttp2TlsReactor*(port: int; certFile: string; keyFile: string;
-                           handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
-  ## Serve HTTP/2 over TLS on `port`, advertising ALPN "h2" only, on the
-  ## reactor. A connection whose ALPN does not settle on "h2" is closed — this
-  ## entry point is h2-only; use `serveHttpsAlpnReactor` to serve both. Blocks,
-  ## multiplexing every connection, handshakes included, on one thread.
+proc serveHttp2TlsReactor*(port: int; ctx: TlsContext; handler: H2Handler;
+                           idleTimeoutMs = IdleTimeoutMs) =
+  ## Serve HTTP/2 over TLS on `port` with a context YOU built and configured —
+  ## protocol versions, cipher suites, key-exchange groups (including the
+  ## post-quantum ones), extra SNI certificates, session resumption. Advertises
+  ## ALPN "h2" only; a connection that does not settle on "h2" is closed.
   gH2Handler = handler
   gAlpnH2Only = true
-  discard serveTlsAlpn(port, certFile, keyFile, @["h2"], idleTimeoutMs)
+  discard serveTlsAlpn(port, ctx, @["h2"], idleTimeoutMs)
 
-proc serveHttpsAlpnReactor*(port: int; certFile: string; keyFile: string;
-                            handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
+proc serveHttp2TlsReactor*(port: int; certFile: string; keyFile: string;
+                           handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
+  ## As above, with a default context built from a PEM cert chain and key.
+  serveHttp2TlsReactor(port, newTlsServerContext(certFile, keyFile), handler,
+                       idleTimeoutMs)
+
+proc serveHttpsAlpnReactor*(port: int; ctx: TlsContext; handler: H2Handler;
+                            idleTimeoutMs = IdleTimeoutMs) =
   ## What a real HTTPS port does: advertise both `h2` and `http/1.1`, then serve
   ## each connection with whichever the client chose — HTTP/2 for a modern
   ## browser or curl, HTTP/1.1 for anything older — from the same handler, on
-  ## the one thread.
+  ## the one thread. Takes a context you configured.
   ##
   ## `H2Handler` and `ReactorHandler` are the same shape
   ## (`proc(req: Request): Response {.nimcall.}`), so one handler covers both
@@ -213,4 +223,10 @@ proc serveHttpsAlpnReactor*(port: int; certFile: string; keyFile: string;
   gH2Handler = handler
   gAlpnH2Only = false
   setReactorHttpHandler(handler, idleTimeoutMs)
-  discard serveTlsAlpn(port, certFile, keyFile, @["h2", "http/1.1"], idleTimeoutMs)
+  discard serveTlsAlpn(port, ctx, @["h2", "http/1.1"], idleTimeoutMs)
+
+proc serveHttpsAlpnReactor*(port: int; certFile: string; keyFile: string;
+                            handler: H2Handler; idleTimeoutMs = IdleTimeoutMs) =
+  ## As above, with a default context built from a PEM cert chain and key.
+  serveHttpsAlpnReactor(port, newTlsServerContext(certFile, keyFile), handler,
+                        idleTimeoutMs)

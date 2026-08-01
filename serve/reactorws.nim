@@ -407,14 +407,18 @@ proc serveWsReactor*(port: int; handler: WsHandler; idleTimeoutMs = 0) =
   r.spawn(delay(acceptLoopWs(r, listenFd)))
   r.run()
 
-proc serveWssReactor*(port: int; certFile: string; keyFile: string;
-                      handler: WsHandler; idleTimeoutMs = 0) =
+proc serveWssReactor*(port: int; ctx0: TlsContext; handler: WsHandler;
+                      idleTimeoutMs = 0) =
   ## Serve **wss://** — the same WebSocket server over TLS, same coroutine, same
   ## thread (asyncconn.nim), with the handshake pumped asynchronously. ALPN
   ## advertises `http/1.1`, which is what the Upgrade dance rides on.
+  ##
+  ## The context is the caller's, so every TLS knob stays reachable: protocol
+  ## versions, cipher suites, key-exchange groups (post-quantum included), extra
+  ## SNI certificates, session resumption.
   gWsHandler = handler
   gWsIdleMs = idleTimeoutMs
-  var ctx = newTlsServerContext(certFile, keyFile)
+  var ctx = ctx0
   if not ctx.isValid:
     return
   discard ctx.setAlpnServer(@["http/1.1"])
@@ -427,3 +431,9 @@ proc serveWssReactor*(port: int; certFile: string; keyFile: string;
   r.register(listenFd)
   r.spawn(delay(acceptLoopWss(r, listenFd)))
   r.run()
+
+proc serveWssReactor*(port: int; certFile: string; keyFile: string;
+                      handler: WsHandler; idleTimeoutMs = 0) =
+  ## As above, with a default context built from a PEM cert chain and key.
+  serveWssReactor(port, newTlsServerContext(certFile, keyFile), handler,
+                  idleTimeoutMs)
