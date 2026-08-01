@@ -5,16 +5,12 @@
 # the live single-thread reactor server.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8153}"
 
 echo "== build reactor_ws =="
-"$NIMONY" c --nimcache:"$NC" \
-  --path:"$ROOT" --path:"$H/aoughwl-http" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" --path:"$H/aoughwl-compress" \
-  --path:"$H/aoughwl-ws" "$ROOT/examples/reactor_ws.nim" 2>&1 \
-  | grep -viE '^nifmake|^FAILURE|niflink' || true
-BIN="$(find "$NC" -type f -name reactor_ws -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" reactor_ws)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 "$BIN" "$PORT" >/dev/null 2>&1 &

@@ -4,7 +4,8 @@
 # round-trips.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NIMONY="${NIMONY:-$HOME/nimony/bin/nimony}"
+# shellcheck source=tests/lib.sh
+source "$ROOT/tests/lib.sh"
 H="$HOME"; NC="$(mktemp -d)"; PORT="${PORT:-8492}"
 CERT="$NC/cert.pem"; KEY="$NC/key.pem"
 
@@ -17,10 +18,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -addext "subjectAltName=DNS:localhost" 2>/dev/null
 
 echo "== build dgram_echo =="
-"$NIMONY" c --nimcache:"$NC" --path:"$ROOT" --path:"$H/aoughwl-tcp" \
-  --path:"$H/aoughwl-http" --path:"$H/aoughwl-net" --path:"$H/aoughwl-tls" \
-  "$ROOT/examples/dgram_echo.nim" 2>&1 | grep -iE 'Error:|FAILURE' && exit 1 || true
-BIN="$(find "$NC" -type f -name dgram_echo -executable | head -1)"
+BIN="$(build_example "$ROOT" "$NC" dgram_echo)" || BIN=""
 [[ -n "$BIN" ]] || { echo "build failed"; exit 1; }
 
 export LD_LIBRARY_PATH="$ROOT/quic"
