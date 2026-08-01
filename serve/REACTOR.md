@@ -101,6 +101,21 @@ per connection, all multiplexed on one OS thread:
   *Verified: 20 independent QUIC clients (20/20) on one thread*
   (`tests/reactor_h3_e2e.sh`); the pure-C harness is ASan/LSan-clean.
 
+- **WebTransport** (same shim, `AQ_WEBTRANSPORT` — needs vendored nghttp3 ≥ 1.x
+  from `quic/build-nghttp3.sh`). A session is an HTTP/3 extended CONNECT with
+  `:protocol=webtransport`, answered 200 with the CONNECT stream held open.
+  Over it:
+  - **datagrams** — `wtSendDatagram` / `takeDatagram`, carried as H3 datagrams
+    (quarter-stream-id flow prefix) over RFC 9221 QUIC datagrams. *Verified:
+    session + datagram round-trip* (`tests/reactor_wt_e2e.sh`).
+  - **streams** — `wtOpenStream(uni)`, `wtStreamSend(…, fin)`, `wtTakeStream`,
+    `wtStreamRecv`, `wtStreamFin`. These are ordinary QUIC streams carrying the
+    `WEBTRANSPORT_STREAM` signal (`0x41` bidi / `0x54` uni) plus a session id, so
+    the shim routes them itself and they never reach nghttp3; a stream that
+    turns out to be plain HTTP/3 has its held opening bytes replayed into
+    nghttp3 instead. *Verified: bidi echo + a uni stream in each direction on one
+    thread* (`tests/reactor_wtstream_e2e.sh`), ASan-clean.
+
 Both TCP servers use a module-global `{.nimcall.}` handler (the `pool.nim` pattern) rather
 than a captured closure, which composes cleanly across the coroutine boundary,
 and flag-based control flow throughout (no `break`/`return` beside a `suspend`).
