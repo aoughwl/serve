@@ -226,6 +226,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
     var chunked = false
     var complete = false
     var connErr = false
+    var tooLarge = false
     while (not complete) and (not connErr):
       if headerEnd < 0:
         headerEnd = headerTerminator(raw)
@@ -248,6 +249,7 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
             complete = true
       if (not complete) and raw.len >= gMaxRequestBytes:
         connErr = true
+        tooLarge = true
       if (not complete) and (not connErr):
         var n = 0
         r.awaitConnRead(c, addr buf[0], ReadChunk, n)
@@ -260,6 +262,22 @@ proc handleHttpConn*(r: Reactor; c0: Conn) {.passive.} =
             inc k
     # --- handle + write -----------------------------------------------------
     if connErr:
+      # ⚠️ AN OVERSIZED REQUEST GETS ITS 413. This closed the connection without a
+      # word, so a client still writing its body saw EPIPE and never a status --
+      # "large POST fails from one client and works from another" (master inbox,
+      # 2026-08-13). The answer goes out before the close; a client that reads
+      # while it writes sees why.
+      if tooLarge:
+        let msg = "request larger than " & $gMaxRequestBytes & " bytes"
+        let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: " &
+                   $msg.len & "\r\nConnection: close\r\n\r\n" & msg
+        var rb = newSeq[char](resp.len)
+        var ri = 0
+        while ri < resp.len:
+          rb[ri] = resp[ri]
+          inc ri
+        var wok = false
+        r.awaitConnWriteAll(c, addr rb[0], rb.len, wok)
       alive = false
     else:
       if chunked and headerEnd >= 0:
