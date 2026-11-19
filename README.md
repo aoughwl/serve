@@ -1,3 +1,5 @@
+> **Moved.** This library now lives in [aoughwl/std](https://github.com/aoughwl/std/tree/main/serve) (directory `serve/`), with its full history. This repository is kept as a redirect; new work happens in `aoughwl/std`.
+
 # serve
 
 A high-level, programmable HTTP server for
